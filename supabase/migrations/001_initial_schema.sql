@@ -17,7 +17,6 @@ ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Authenticated users can read profiles"
   ON profiles FOR SELECT TO authenticated USING (true);
 
--- Populate a profile row whenever a new user signs up.
 CREATE OR REPLACE FUNCTION handle_new_user()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
@@ -45,14 +44,6 @@ CREATE TABLE IF NOT EXISTS rooms (
 
 ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
 
--- Creators and members can read their rooms.
-CREATE POLICY "Members and creators can view rooms"
-  ON rooms FOR SELECT TO authenticated
-  USING (
-    created_by = auth.uid()
-    OR id IN (SELECT room_id FROM room_members WHERE user_id = auth.uid())
-  );
-
 -- ─── room_members ─────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS room_members (
@@ -73,9 +64,15 @@ CREATE POLICY "Members can view their room membership"
     )
   );
 
+-- Now that room_members exists, we can create the rooms SELECT policy.
+CREATE POLICY "Members and creators can view rooms"
+  ON rooms FOR SELECT TO authenticated
+  USING (
+    created_by = auth.uid()
+    OR id IN (SELECT room_id FROM room_members WHERE user_id = auth.uid())
+  );
+
 -- ─── SECURITY DEFINER helpers ─────────────────────────────────────────────────
--- These run as the DB owner to bypass RLS for the create/join flows, where a
--- user needs to insert a room before they are yet listed as a member of it.
 
 CREATE OR REPLACE FUNCTION create_room(p_name text, p_invite_code text)
 RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
@@ -115,7 +112,6 @@ END;
 $$;
 
 -- ─── sessions ────────────────────────────────────────────────────────────────
--- Schema only — no UI in Stage 0.
 
 CREATE TABLE IF NOT EXISTS sessions (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -130,7 +126,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 
 -- ─── session_events ───────────────────────────────────────────────────────────
--- Schema only — no UI in Stage 0.
 
 CREATE TABLE IF NOT EXISTS session_events (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
