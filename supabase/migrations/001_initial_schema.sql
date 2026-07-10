@@ -55,21 +55,32 @@ CREATE TABLE IF NOT EXISTS room_members (
 
 ALTER TABLE room_members ENABLE ROW LEVEL SECURITY;
 
+-- Membership check used by RLS policies. Must be SECURITY DEFINER so its
+-- internal read of room_members runs as the table owner (RLS-exempt) rather
+-- than re-triggering room_members' own SELECT policy — otherwise the policy
+-- referencing room_members from within room_members causes Postgres error
+-- 42P17 "infinite recursion detected in policy for relation room_members".
+CREATE OR REPLACE FUNCTION is_room_member(p_room_id uuid)
+RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path = public STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.room_members
+    WHERE room_id = p_room_id AND user_id = auth.uid()
+  );
+$$;
+
 -- Members can see all members of any room they belong to.
+DROP POLICY IF EXISTS "Members can view their room membership" ON room_members;
 CREATE POLICY "Members can view their room membership"
   ON room_members FOR SELECT TO authenticated
-  USING (
-    room_id IN (
-      SELECT rm2.room_id FROM room_members rm2 WHERE rm2.user_id = auth.uid()
-    )
-  );
+  USING ( is_room_member(room_id) );
 
 -- Now that room_members exists, we can create the rooms SELECT policy.
+DROP POLICY IF EXISTS "Members and creators can view rooms" ON rooms;
 CREATE POLICY "Members and creators can view rooms"
   ON rooms FOR SELECT TO authenticated
   USING (
     created_by = auth.uid()
-    OR id IN (SELECT room_id FROM room_members WHERE user_id = auth.uid())
+    OR is_room_member(id)
   );
 
 -- ─── SECURITY DEFINER helpers ─────────────────────────────────────────────────
@@ -136,3 +147,18 @@ CREATE TABLE IF NOT EXISTS session_events (
 );
 
 ALTER TABLE session_events ENABLE ROW LEVEL SECURITY;
+
+-- ─── grants ──────────────────────────────────────────────────────────────────
+-- Postgres checks table-level privileges BEFORE row-level security. Without
+-- these grants every query fails with 42501 "permission denied for table",
+-- regardless of RLS policies. RLS still controls which rows are visible.
+-- Reads are SELECT-only for authenticated; all writes go through the
+-- SECURITY DEFINER functions above, so no INSERT/UPDATE/DELETE grants needed.
+
+GRANT USAGE ON SCHEMA public TO authenticated, service_role;
+GRANT SELECT ON public.profiles, public.rooms, public.room_members,
+  public.sessions, public.session_events TO authenticated;
+
+-- tandem-server (Stage 2+) uses the service role key, which bypasses RLS but
+-- still needs table privileges.
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;

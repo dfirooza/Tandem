@@ -16,6 +16,9 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - tandem-cli wraps the real `claude` binary via node-pty (not 
   child_process.spawn — Claude Code needs a real PTY for interactive 
   behavior to work correctly).
+- On Windows, tandem-cli spawns the target through `cmd.exe /c` because 
+  npm-installed `claude` is a .cmd shim that ConPTY's CreateProcess 
+  cannot resolve directly.
 
 ## Data model (Supabase)
 - users (from Supabase Auth)
@@ -26,8 +29,14 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 0: scaffolding — Next.js app, Supabase auth, room create/join. 
-No live functionality yet.
+Stage 2 complete and verified end-to-end. tandem-cli streams session 
+events to tandem-server over WebSocket; server verifies Supabase JWTs, 
+writes session_events durably, marks sessions ended on disconnect. 
+A durability bug (events dropped on client disconnect — the exact 
+tail-of-session pattern) was caught by test/e2e-stage2.mjs and fixed. 
+dotenv added to tandem-server (approved deviation). No Liveblocks yet.
+Next: Stage 3 — wire tandem-server to Liveblocks + build live session 
+panels in tandem-web.
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

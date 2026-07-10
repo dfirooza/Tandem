@@ -1,0 +1,25 @@
+{
+  "name": "tandem-server",
+  "version": "0.1.0",
+  "description": "Tandem server — receives session events from tandem-cli over WebSocket and writes them durably to Supabase",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.0",
+    "dotenv": "^16.4.0",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  }
+}

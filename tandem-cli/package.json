@@ -1,0 +1,26 @@
+{
+  "name": "tandem-cli",
+  "version": "0.1.0",
+  "description": "Tandem CLI wrapper — runs Claude Code inside a PTY and captures session output",
+  "type": "module",
+  "bin": {
+    "tandem": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "strip-ansi": "^7.1.0",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  }
+}
