@@ -29,14 +29,14 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 2 complete and verified end-to-end. tandem-cli streams session 
-events to tandem-server over WebSocket; server verifies Supabase JWTs, 
-writes session_events durably, marks sessions ended on disconnect. 
-A durability bug (events dropped on client disconnect — the exact 
-tail-of-session pattern) was caught by test/e2e-stage2.mjs and fixed. 
-dotenv added to tandem-server (approved deviation). No Liveblocks yet.
-Next: Stage 3 — wire tandem-server to Liveblocks + build live session 
-panels in tandem-web.
+Stage 3 complete and verified end-to-end. tandem-server mirrors session 
+lifecycle and events into per-room Liveblocks storage alongside the 
+existing Supabase durable writes. tandem-web renders live, auto-scrolling 
+session panels per active session with presence, confirmed working with 
+two concurrent tandem claude sessions streaming simultaneously into the 
+same room in the browser. 
+Next: Stage 4 — live cursors, reconnect/resume handling, late-joiner 
+backfill from Supabase history.
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

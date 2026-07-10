@@ -1,10 +1,17 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
+import {
+  Liveblocks,
+  LiveList,
+  LiveMap,
+  LiveObject,
+} from "@liveblocks/node";
 import { WebSocketServer, WebSocket } from "ws";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, LIVEBLOCKS_SECRET_KEY } =
+  process.env;
 const PORT = Number(process.env.PORT ?? 8787);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -20,6 +27,110 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+
+// ─── Liveblocks (live/ephemeral layer) ───────────────────────────────────────
+// This server is the ONLY writer to Liveblocks. Supabase remains the durable
+// source of truth; every Liveblocks write happens alongside (never instead
+// of) the Supabase write, and a Liveblocks failure must never block it.
+
+const liveblocks = LIVEBLOCKS_SECRET_KEY
+  ? new Liveblocks({ secret: LIVEBLOCKS_SECRET_KEY })
+  : null;
+
+if (!liveblocks) {
+  console.warn(
+    "[tandem-server] LIVEBLOCKS_SECRET_KEY not set — running without the " +
+      "live layer. Sessions are still written durably to Supabase."
+  );
+}
+
+/** One Liveblocks room per Tandem room. */
+const liveRoomId = (roomId: string) => `tandem-room-${roomId}`;
+
+/** Rooms already upserted this process, to skip redundant API calls. */
+const ensuredLiveRooms = new Set<string>();
+
+async function ensureLiveRoom(roomId: string): Promise<void> {
+  if (!liveblocks || ensuredLiveRooms.has(roomId)) return;
+  // upsertRoom requires a non-empty update; re-asserting defaultAccesses is
+  // idempotent and creates the room if it doesn't exist yet.
+  await liveblocks.upsertRoom(liveRoomId(roomId), {
+    update: { defaultAccesses: ["room:write"] },
+  });
+  ensuredLiveRooms.add(roomId);
+}
+
+/**
+ * Live storage shape per room:
+ *   root.sessions: LiveMap<sessionId, LiveObject<{
+ *     userId, status, events: LiveList<{ eventType, content, timestamp }>
+ *   }>>
+ */
+type LiveSession = LiveObject<{
+  userId: string;
+  status: string;
+  events: LiveList<{ eventType: string; content: string; timestamp: string }>;
+}>;
+
+async function liveSessionStart(state: ConnectionState): Promise<void> {
+  if (!liveblocks) return;
+  try {
+    await ensureLiveRoom(state.roomId);
+    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
+      let sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+      if (!sessions) {
+        sessions = new LiveMap();
+        root.set("sessions", sessions);
+      }
+      sessions.set(
+        state.sessionId,
+        new LiveObject({
+          userId: state.userId,
+          status: "active",
+          events: new LiveList([]),
+        })
+      );
+    });
+  } catch (err) {
+    console.error(
+      `[tandem-server] liveblocks: failed to start session ` +
+        `${state.sessionId}: ${err instanceof Error ? err.message : err}`
+    );
+  }
+}
+
+async function liveSessionEvent(
+  state: ConnectionState,
+  event: { eventType: string; content: string; timestamp: string }
+): Promise<void> {
+  if (!liveblocks) return;
+  try {
+    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
+      const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+      sessions?.get(state.sessionId)?.get("events").push(event);
+    });
+  } catch (err) {
+    console.error(
+      `[tandem-server] liveblocks: failed to push event for session ` +
+        `${state.sessionId}: ${err instanceof Error ? err.message : err}`
+    );
+  }
+}
+
+async function liveSessionEnd(state: ConnectionState): Promise<void> {
+  if (!liveblocks) return;
+  try {
+    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
+      const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+      sessions?.get(state.sessionId)?.set("status", "ended");
+    });
+  } catch (err) {
+    console.error(
+      `[tandem-server] liveblocks: failed to end session ` +
+        `${state.sessionId}: ${err instanceof Error ? err.message : err}`
+    );
+  }
+}
 
 // ─── Protocol types ──────────────────────────────────────────────────────────
 
@@ -89,7 +200,13 @@ async function handleAuth(
     `[tandem-server] session ${session.id} started ` +
       `(user ${msg.userId}, room ${msg.roomId})`
   );
-  return { userId: msg.userId, roomId: msg.roomId, sessionId: session.id };
+  const state: ConnectionState = {
+    userId: msg.userId,
+    roomId: msg.roomId,
+    sessionId: session.id,
+  };
+  await liveSessionStart(state);
+  return state;
 }
 
 async function handleEvent(state: ConnectionState, msg: EventMessage) {
@@ -112,6 +229,11 @@ async function handleEvent(state: ConnectionState, msg: EventMessage) {
         `${state.sessionId}: ${error.message}`
     );
   }
+  await liveSessionEvent(state, {
+    eventType: msg.eventType,
+    content: msg.content,
+    timestamp: msg.timestamp,
+  });
 }
 
 async function endSession(state: ConnectionState) {
@@ -126,6 +248,7 @@ async function endSession(state: ConnectionState) {
   } else {
     console.log(`[tandem-server] session ${state.sessionId} ended`);
   }
+  await liveSessionEnd(state);
 }
 
 const wss = new WebSocketServer({ port: PORT });

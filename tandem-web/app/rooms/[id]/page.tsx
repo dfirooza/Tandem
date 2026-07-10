@@ -2,6 +2,7 @@ import { redirect, notFound } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 import { signOut } from '@/app/auth/actions'
+import LiveSessionSection from './live'
 
 export default async function RoomPage({
   params,
@@ -67,6 +68,12 @@ export default async function RoomPage({
           </li>
         ))}
       </ul>
+
+      <LiveSessionSection
+        roomId={room.id}
+        selfEmail={user.email ?? user.id}
+        emailById={emailById}
+      />
     </main>
   )
 }
