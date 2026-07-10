@@ -148,6 +148,21 @@ CREATE TABLE IF NOT EXISTS session_events (
 
 ALTER TABLE session_events ENABLE ROW LEVEL SECURITY;
 
+-- Room members can read session history (Stage 4 late-joiner backfill:
+-- tandem-web renders durable history when Liveblocks storage is missing it).
+-- Writes stay exclusive to tandem-server's service role.
+DROP POLICY IF EXISTS "Members can view sessions in their rooms" ON sessions;
+CREATE POLICY "Members can view sessions in their rooms"
+  ON sessions FOR SELECT TO authenticated
+  USING ( is_room_member(room_id) );
+
+DROP POLICY IF EXISTS "Members can view session events in their rooms" ON session_events;
+CREATE POLICY "Members can view session events in their rooms"
+  ON session_events FOR SELECT TO authenticated
+  USING (
+    session_id IN (SELECT id FROM public.sessions WHERE is_room_member(room_id))
+  );
+
 -- ─── grants ──────────────────────────────────────────────────────────────────
 -- Postgres checks table-level privileges BEFORE row-level security. Without
 -- these grants every query fails with 42501 "permission denied for table",

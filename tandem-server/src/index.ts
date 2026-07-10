@@ -251,10 +251,73 @@ async function endSession(state: ConnectionState) {
   await liveSessionEnd(state);
 }
 
+// ─── Orphan sweep ────────────────────────────────────────────────────────────
+// If the server crashes, sessions it was holding are never marked ended. This
+// is a single-server architecture: at boot no connections exist yet, so any
+// session still "active" is by definition orphaned — end it. (Liveblocks
+// entries for orphans are corrected lazily: statuses there matter less than
+// the durable record, and rewriting every room's storage at boot is wasteful.)
+{
+  const { data: orphans, error } = await supabase
+    .from("sessions")
+    .update({ status: "ended", ended_at: new Date().toISOString() })
+    .eq("status", "active")
+    .select("id, room_id");
+  if (error) {
+    console.error(`[tandem-server] orphan sweep failed: ${error.message}`);
+  } else if (orphans && orphans.length > 0) {
+    console.log(
+      `[tandem-server] orphan sweep: ended ${orphans.length} session(s) ` +
+        `left active by a previous run`
+    );
+    if (liveblocks) {
+      for (const orphan of orphans) {
+        try {
+          await liveblocks.mutateStorage(
+            liveRoomId(orphan.room_id),
+            ({ root }) => {
+              const sessions = root.get("sessions") as LiveMap<
+                string,
+                LiveSession
+              >;
+              sessions?.get(orphan.id)?.set("status", "ended");
+            }
+          );
+        } catch {
+          // Room may not exist in Liveblocks; the durable record is what counts.
+        }
+      }
+    }
+  }
+}
+
 const wss = new WebSocketServer({ port: PORT });
+
+// ─── Heartbeat ───────────────────────────────────────────────────────────────
+// An abrupt network drop (e.g. wifi cut) sends no close frame, so without
+// pings the socket — and its session — would stay "active" until the OS TCP
+// timeout. Ping every 15s; a peer that misses one round is terminated, which
+// fires "close" and ends the session normally.
+
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const aliveSockets = new WeakSet<WebSocket>();
+
+setInterval(() => {
+  for (const client of wss.clients) {
+    if (!aliveSockets.has(client)) {
+      client.terminate();
+      continue;
+    }
+    aliveSockets.delete(client);
+    client.ping();
+  }
+}, HEARTBEAT_INTERVAL_MS);
 
 wss.on("connection", (ws) => {
   let state: ConnectionState | null = null;
+
+  aliveSockets.add(ws);
+  ws.on("pong", () => aliveSockets.add(ws));
 
   // Process messages sequentially so auth always completes before events,
   // and events are inserted in arrival order.

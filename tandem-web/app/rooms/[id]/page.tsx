@@ -39,6 +39,34 @@ export default async function RoomPage({
 
   const emailById = Object.fromEntries((profileRows ?? []).map((p) => [p.id, p.email]))
 
+  // Durable session history for the late-joiner backfill: if Liveblocks
+  // storage is missing a session's events, the client falls back to this.
+  const { data: dbSessions } = await supabase
+    .from('sessions')
+    .select('id, user_id, status')
+    .eq('room_id', id)
+    .order('started_at', { ascending: true })
+
+  const dbSessionIds = dbSessions?.map((s) => s.id) ?? []
+  const { data: dbEvents } = dbSessionIds.length
+    ? await supabase
+        .from('session_events')
+        .select('session_id, content')
+        .in('session_id', dbSessionIds)
+        .order('created_at', { ascending: true })
+    : { data: [] }
+
+  const contentBySession: Record<string, string[]> = {}
+  for (const e of dbEvents ?? []) {
+    ;(contentBySession[e.session_id] ??= []).push(e.content ?? '')
+  }
+  const historySessions = (dbSessions ?? []).map((s) => ({
+    sessionId: s.id,
+    userId: s.user_id,
+    status: s.status,
+    content: (contentBySession[s.id] ?? []).join(''),
+  }))
+
   return (
     <main>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -73,6 +101,7 @@ export default async function RoomPage({
         roomId={room.id}
         selfEmail={user.email ?? user.id}
         emailById={emailById}
+        historySessions={historySessions}
       />
     </main>
   )

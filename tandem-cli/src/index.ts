@@ -68,42 +68,71 @@ if (!userId) {
 
 // ─── WebSocket client ────────────────────────────────────────────────────────
 // Streams captured output to tandem-server in real time. Connection problems
-// must never interrupt the Claude Code session: on any failure we warn once
-// on stderr and continue local-only.
+// must never interrupt the Claude Code session: on an unexpected drop we warn
+// on stderr and keep reconnecting in the background with exponential backoff,
+// indefinitely, for as long as the wrapped process is running. The server does
+// not resume sessions, so a successful reconnect starts a NEW session — we say
+// so on stderr rather than faking continuity.
 
-type WireState = "connecting" | "ready" | "dead";
+type WireState = "connecting" | "ready" | "reconnecting" | "dead";
 let wireState: WireState = "connecting";
 let sessionId: string | null = null;
-/** Chunks captured before auth_ok arrives, flushed once we have a sessionId. */
-const pendingEvents: { content: string; timestamp: string }[] = [];
-
-/** True once we start our own graceful shutdown — suppresses the offline warning. */
+/** True once any session was established — distinguishes reconnects. */
+let everHadSession = false;
+/** True once we start our own graceful shutdown — stops reconnecting. */
 let shuttingDown = false;
 
-function warnOffline(reason: string) {
-  if (wireState === "dead") return;
-  wireState = "dead";
-  pendingEvents.length = 0;
-  if (shuttingDown) return;
-  process.stderr.write(
-    `\n[tandem] warning: lost connection to tandem-server (${reason}). ` +
-      `Session continues locally; events are no longer being sent.\n`
-  );
-}
-
 let ws: WebSocket | null = null;
-try {
-  ws = new WebSocket(serverUrl!);
-} catch (err) {
-  warnOffline(err instanceof Error ? err.message : String(err));
+let reconnectTimer: NodeJS.Timeout | null = null;
+let backoffMs = 1_000;
+const MAX_BACKOFF_MS = 30_000;
+
+// Chunks captured while no session is ready (before the first auth_ok, or
+// mid-reconnect), flushed into the (new) session once one is established.
+// Bounded so an extended outage cannot grow memory without limit.
+const MAX_PENDING_EVENTS = 5_000;
+const pendingEvents: { content: string; timestamp: string }[] = [];
+
+// Application close codes from tandem-server that a retry cannot fix
+// (bad/expired token, protocol violation). Retrying would just loop.
+const FATAL_CLOSE_CODES = new Set([4001, 4002]);
+
+function goDead(message: string) {
+  wireState = "dead";
+  ws = null;
+  pendingEvents.length = 0;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (!shuttingDown) {
+    process.stderr.write(
+      `\n[tandem] ${message} Session continues locally; events are no ` +
+        `longer being sent.\n`
+    );
+  }
 }
 
-if (ws) {
-  ws.on("open", () => {
-    ws!.send(JSON.stringify({ type: "auth", roomId, userId, token: userToken }));
+function connect() {
+  reconnectTimer = null;
+  if (shuttingDown || wireState === "dead") return;
+
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(serverUrl!);
+  } catch (err) {
+    handleDrop(null, err instanceof Error ? err.message : String(err));
+    return;
+  }
+  ws = socket;
+
+  socket.on("open", () => {
+    socket.send(
+      JSON.stringify({ type: "auth", roomId, userId, token: userToken })
+    );
   });
 
-  ws.on("message", (raw) => {
+  socket.on("message", (raw) => {
     let msg: { type?: string; sessionId?: string };
     try {
       msg = JSON.parse(raw.toString());
@@ -113,6 +142,15 @@ if (ws) {
     if (msg.type === "auth_ok" && typeof msg.sessionId === "string") {
       sessionId = msg.sessionId;
       wireState = "ready";
+      backoffMs = 1_000;
+      if (everHadSession) {
+        process.stderr.write(
+          `\n[tandem] reconnected to tandem-server. The server does not ` +
+            `resume sessions — output now streams to new session ` +
+            `${sessionId}.\n`
+        );
+      }
+      everHadSession = true;
       for (const event of pendingEvents.splice(0)) {
         sendEvent(event.content, event.timestamp);
       }
@@ -121,19 +159,52 @@ if (ws) {
 
   // Connection failures can surface as AggregateError with an empty message;
   // fall back to the error code so the warning stays informative.
-  ws.on("error", (err) =>
-    warnOffline(
+  socket.on("error", (err) =>
+    handleDrop(
+      socket,
       err.message || (err as NodeJS.ErrnoException).code || err.name
     )
   );
-  ws.on("close", (code, reason) => {
-    warnOffline(`closed: ${code}${reason.length ? ` ${reason}` : ""}`);
+  socket.on("close", (code, reason) => {
+    if (!shuttingDown && FATAL_CLOSE_CODES.has(code)) {
+      goDead(
+        `tandem-server rejected the connection (${code}: ${reason}). ` +
+          `Not retrying — check TANDEM_USER_TOKEN (it may have expired).`
+      );
+      return;
+    }
+    handleDrop(socket, `closed: ${code}${reason.length ? ` ${reason}` : ""}`);
   });
 }
 
+/** Handles an unexpected drop of `socket` (null = constructor failure). */
+function handleDrop(socket: WebSocket | null, reason: string) {
+  // "error" is typically followed by "close" on the same socket; the first
+  // call clears `ws`, so the second is recognized as stale and ignored.
+  if (socket !== null && ws !== socket) return;
+  if (shuttingDown || wireState === "dead") return;
+
+  ws = null;
+  sessionId = null;
+  if (wireState !== "reconnecting") {
+    process.stderr.write(
+      `\n[tandem] warning: lost connection to tandem-server (${reason}). ` +
+        `Claude Code is unaffected; reconnecting in the background...\n`
+    );
+  }
+  wireState = "reconnecting";
+
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(connect, backoffMs);
+  backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+}
+
+connect();
+
 function sendEvent(content: string, timestamp: string) {
-  if (wireState === "dead" || !ws) return;
-  if (wireState === "connecting" || !sessionId) {
+  if (wireState === "dead") return;
+  if (wireState !== "ready" || !ws || !sessionId) {
+    if (pendingEvents.length >= MAX_PENDING_EVENTS) pendingEvents.shift();
     pendingEvents.push({ content, timestamp });
     return;
   }
@@ -211,6 +282,7 @@ ptyProcess.onExit(({ exitCode }) => {
   // Close the WebSocket gracefully so the server marks the session ended,
   // giving buffered sends a moment to flush — but never hold the exit long.
   shuttingDown = true;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
   if (ws && wireState === "ready" && ws.readyState === WebSocket.OPEN) {
     const timeout = setTimeout(() => process.exit(exitCode), 750);
     ws.on("close", () => {

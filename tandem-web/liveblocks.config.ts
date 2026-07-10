@@ -8,6 +8,8 @@ declare global {
   interface Liveblocks {
     Presence: {
       email: string
+      /** Pointer position relative to the live section, null when outside. */
+      cursor: { x: number; y: number } | null
     }
     Storage: {
       sessions: LiveMap<
