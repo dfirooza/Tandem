@@ -17,6 +17,8 @@ declare global {
         LiveObject<{
           userId: string
           status: string
+          /** Set when the session was branched from another (Stage 5). */
+          parentSessionId?: string | null
           events: LiveList<{ eventType: string; content: string; timestamp: string }>
         }>
       >

@@ -41,9 +41,11 @@ export default async function RoomPage({
 
   // Durable session history for the late-joiner backfill: if Liveblocks
   // storage is missing a session's events, the client falls back to this.
+  // Events are kept per-event (not joined) so each one can host a
+  // "branch from here" target.
   const { data: dbSessions } = await supabase
     .from('sessions')
-    .select('id, user_id, status')
+    .select('id, user_id, status, parent_session_id')
     .eq('room_id', id)
     .order('started_at', { ascending: true })
 
@@ -56,16 +58,23 @@ export default async function RoomPage({
         .order('created_at', { ascending: true })
     : { data: [] }
 
-  const contentBySession: Record<string, string[]> = {}
+  const eventsBySession: Record<string, { content: string }[]> = {}
   for (const e of dbEvents ?? []) {
-    ;(contentBySession[e.session_id] ??= []).push(e.content ?? '')
+    ;(eventsBySession[e.session_id] ??= []).push({ content: e.content ?? '' })
   }
   const historySessions = (dbSessions ?? []).map((s) => ({
     sessionId: s.id,
     userId: s.user_id,
     status: s.status,
-    content: (contentBySession[s.id] ?? []).join(''),
+    parentSessionId: s.parent_session_id as string | null,
+    events: eventsBySession[s.id] ?? [],
   }))
+
+  // sessionId -> owner userId for every session in the room, so branched
+  // panels can label their parent's owner.
+  const ownerBySessionId = Object.fromEntries(
+    (dbSessions ?? []).map((s) => [s.id, s.user_id])
+  )
 
   return (
     <main>
@@ -102,6 +111,7 @@ export default async function RoomPage({
         selfEmail={user.email ?? user.id}
         emailById={emailById}
         historySessions={historySessions}
+        ownerBySessionId={ownerBySessionId}
       />
     </main>
   )

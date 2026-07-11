@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
 import {
   Liveblocks,
@@ -69,6 +70,8 @@ async function ensureLiveRoom(roomId: string): Promise<void> {
 type LiveSession = LiveObject<{
   userId: string;
   status: string;
+  /** Set when this session was branched from another (Stage 5). */
+  parentSessionId?: string | null;
   events: LiveList<{ eventType: string; content: string; timestamp: string }>;
 }>;
 
@@ -87,6 +90,7 @@ async function liveSessionStart(state: ConnectionState): Promise<void> {
         new LiveObject({
           userId: state.userId,
           status: "active",
+          parentSessionId: null,
           events: new LiveList([]),
         })
       );
@@ -258,10 +262,14 @@ async function endSession(state: ConnectionState) {
 // entries for orphans are corrected lazily: statuses there matter less than
 // the durable record, and rewriting every room's storage at boot is wasteful.)
 {
+  // Branched sessions (parent_session_id set) are static copies with no
+  // connection backing them — "active" is their normal state, so they are
+  // not orphans. Revisit if/when live continuation of branches lands.
   const { data: orphans, error } = await supabase
     .from("sessions")
     .update({ status: "ended", ended_at: new Date().toISOString() })
     .eq("status", "active")
+    .is("parent_session_id", null)
     .select("id, room_id");
   if (error) {
     console.error(`[tandem-server] orphan sweep failed: ${error.message}`);
@@ -291,7 +299,202 @@ async function endSession(state: ConnectionState) {
   }
 }
 
-const wss = new WebSocketServer({ port: PORT });
+// ─── Branch endpoint (Stage 5) ───────────────────────────────────────────────
+// Branching is initiated from tandem-web, but this server remains the ONLY
+// writer to Supabase sessions/events and to Liveblocks — the web app's server
+// action calls POST /branch here with the user's Supabase JWT.
+//
+// A branch is a read-and-copy operation: a new session owned by the CLICKING
+// user (anyone in the room may branch anyone's session), seeded with the
+// source's first `eventCount` events. The source is never modified. The copy
+// reads from Supabase ordered by created_at with LIMIT eventCount: Supabase
+// is written before Liveblocks on the live path, so every event a panel can
+// display is already durable, and anything arriving after the click falls
+// beyond the LIMIT.
+//
+// Follow-up idea (NOT this stage): let a new `tandem claude` run attach to a
+// branched session and continue it live.
+
+function sendJson(
+  res: import("node:http").ServerResponse,
+  status: number,
+  body: unknown
+) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function readJsonBody(
+  req: import("node:http").IncomingMessage
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 64 * 1024) {
+        reject(new Error("body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new Error("invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+async function handleBranch(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse
+) {
+  const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) return sendJson(res, 401, { error: "missing bearer token" });
+
+  const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+  if (userErr || !userData.user) {
+    return sendJson(res, 401, { error: "invalid token" });
+  }
+  const userId = userData.user.id;
+
+  let body: { sourceSessionId?: unknown; eventCount?: unknown };
+  try {
+    body = (await readJsonBody(req)) as typeof body;
+  } catch (err) {
+    return sendJson(res, 400, {
+      error: err instanceof Error ? err.message : "bad request",
+    });
+  }
+  const { sourceSessionId, eventCount } = body;
+  if (
+    typeof sourceSessionId !== "string" ||
+    !Number.isInteger(eventCount) ||
+    (eventCount as number) < 1
+  ) {
+    return sendJson(res, 400, {
+      error: "sourceSessionId (string) and eventCount (integer >= 1) required",
+    });
+  }
+
+  const { data: source } = await supabase
+    .from("sessions")
+    .select("id, room_id")
+    .eq("id", sourceSessionId)
+    .maybeSingle();
+  if (!source) return sendJson(res, 404, { error: "source session not found" });
+
+  const { data: membership } = await supabase
+    .from("room_members")
+    .select("user_id")
+    .eq("room_id", source.room_id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!membership) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+
+  const { data: events, error: evErr } = await supabase
+    .from("session_events")
+    .select("type, content, created_at")
+    .eq("session_id", sourceSessionId)
+    .order("created_at", { ascending: true })
+    .limit(eventCount as number);
+  if (evErr) return sendJson(res, 500, { error: evErr.message });
+
+  const { data: branch, error: insErr } = await supabase
+    .from("sessions")
+    .insert({
+      room_id: source.room_id,
+      user_id: userId,
+      parent_session_id: source.id,
+      status: "active",
+    })
+    .select("id")
+    .single();
+  if (insErr || !branch) {
+    return sendJson(res, 500, {
+      error: `failed to create branch session: ${insErr?.message}`,
+    });
+  }
+
+  if (events && events.length > 0) {
+    const { error: copyErr } = await supabase.from("session_events").insert(
+      events.map((e) => ({
+        session_id: branch.id,
+        type: e.type,
+        content: e.content,
+        created_at: e.created_at,
+      }))
+    );
+    if (copyErr) {
+      return sendJson(res, 500, {
+        error: `failed to copy events: ${copyErr.message}`,
+      });
+    }
+  }
+
+  // Mirror into Liveblocks so the branch appears as a panel immediately.
+  // Same alongside-not-instead rule as the live path: a Liveblocks failure
+  // is logged but the durable branch already exists.
+  if (liveblocks) {
+    try {
+      await ensureLiveRoom(source.room_id);
+      await liveblocks.mutateStorage(liveRoomId(source.room_id), ({ root }) => {
+        let sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+        if (!sessions) {
+          sessions = new LiveMap();
+          root.set("sessions", sessions);
+        }
+        sessions.set(
+          branch.id,
+          new LiveObject({
+            userId,
+            status: "active",
+            parentSessionId: source.id,
+            events: new LiveList(
+              (events ?? []).map((e) => ({
+                eventType: e.type,
+                content: e.content ?? "",
+                timestamp: e.created_at,
+              }))
+            ),
+          })
+        );
+      });
+    } catch (err) {
+      console.error(
+        `[tandem-server] liveblocks: failed to mirror branch ${branch.id}: ` +
+          `${err instanceof Error ? err.message : err}`
+      );
+    }
+  }
+
+  console.log(
+    `[tandem-server] session ${branch.id} branched from ${source.id} ` +
+      `at event ${events?.length ?? 0} (by user ${userId})`
+  );
+  sendJson(res, 200, { sessionId: branch.id });
+}
+
+const httpServer = createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/branch") {
+    handleBranch(req, res).catch((err) => {
+      console.error(`[tandem-server] branch failed: ${err?.message ?? err}`);
+      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+    });
+    return;
+  }
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 
 // ─── Heartbeat ───────────────────────────────────────────────────────────────
 // An abrupt network drop (e.g. wifi cut) sends no close frame, so without
@@ -369,4 +572,9 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`[tandem-server] listening on ws://localhost:${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(
+    `[tandem-server] listening on ws://localhost:${PORT} ` +
+      `(POST /branch on the same port)`
+  );
+});

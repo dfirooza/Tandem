@@ -29,16 +29,19 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 4 complete and verified end-to-end. tandem-cli reconnects with 
-exponential backoff on dropped connections, buffers output during 
-outages and flushes on reconnect (new session semantics, no fake 
-continuity). tandem-server has a ping/pong heartbeat to detect silent 
-drops and an orphan-session sweep on boot. Room page shows static 
-history panels for sessions with Supabase data but no Liveblocks state 
-(backfill) — confirmed working in browser. Live presence cursors 
-confirmed working across multiple browser tabs.
-Next: Stage 5 — branching (fork a session at a point in time, diverge 
-into a parallel session).
+Stage 5 complete and verified end-to-end. Any room member can branch 
+from any point in any session (their own or a teammate's) via a 
+server-verified POST /branch endpoint on tandem-server. Branches copy 
+events from Supabase (durable source of truth) up to the click point, 
+seed the corresponding Liveblocks storage, and show a lineage label. 
+Original sessions are unaffected. Branches are static copies for now — 
+live continuation of a branch (attaching a new tandem claude process to 
+continue a branched session) is a known follow-up, not yet built. 
+Confirmed with 11/11 branch e2e tests plus manual browser verification 
+by two real users, including cross-owner branching, source-session 
+integrity, and durability across page refresh.
+Next: Stage 6 — project memory (pin decisions, tag context, inject 
+relevant memory into new tandem claude sessions automatically).
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 
