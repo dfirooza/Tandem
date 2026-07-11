@@ -72,7 +72,17 @@ type LiveSession = LiveObject<{
   status: string;
   /** Set when this session was branched from another (Stage 5). */
   parentSessionId?: string | null;
-  events: LiveList<{ eventType: string; content: string; timestamp: string }>;
+  /** Remote-control mirror (Stage 10). Authoritative state lives in server
+      memory; these fields exist only so browsers can render control UI. */
+  controllerId?: string | null;
+  pendingRequesterId?: string | null;
+  pendingRequestedAt?: string | null;
+  events: LiveList<{
+    eventType: string;
+    content: string;
+    raw?: string;
+    timestamp: string;
+  }>;
 }>;
 
 async function liveSessionStart(state: ConnectionState): Promise<void> {
@@ -105,7 +115,7 @@ async function liveSessionStart(state: ConnectionState): Promise<void> {
 
 async function liveSessionEvent(
   state: ConnectionState,
-  event: { eventType: string; content: string; timestamp: string }
+  event: { eventType: string; content: string; raw?: string; timestamp: string }
 ): Promise<void> {
   if (!liveblocks) return;
   try {
@@ -140,6 +150,8 @@ async function liveSessionEnd(state: ConnectionState): Promise<void> {
 
 interface AuthMessage {
   type: "auth";
+  /** "web" = browser connection (control input); absent/other = CLI. */
+  role?: string;
   roomId: string;
   userId: string;
   token: string;
@@ -149,11 +161,21 @@ interface EventMessage {
   type: "event";
   sessionId: string;
   eventType: string;
+  /** ANSI-stripped content — the durable form stored in Supabase. */
   content: string;
+  /** Raw PTY output with ANSI codes intact, for terminal rendering (live layer only). */
+  raw?: string;
   timestamp: string;
 }
 
-type ClientMessage = AuthMessage | EventMessage;
+/** Browser -> server: keystrokes for a remotely-controlled session. */
+interface SessionInputMessage {
+  type: "session_input";
+  sessionId: string;
+  content: string;
+}
+
+type ClientMessage = AuthMessage | EventMessage | SessionInputMessage;
 
 interface ConnectionState {
   userId: string;
@@ -195,6 +217,22 @@ async function handleAuth(
     return null;
   }
 
+  // Register the live connection BEFORE auth_ok goes out: control requests
+  // can arrive the moment the client learns its sessionId, and they check
+  // this map.
+  cliSocketBySession.set(session.id, ws);
+
+  const state: ConnectionState = {
+    userId: msg.userId,
+    roomId: msg.roomId,
+    sessionId: session.id,
+  };
+
+  // Seed the Liveblocks entry BEFORE auth_ok too: control-state mirroring
+  // assumes the session entry exists once anyone knows the sessionId.
+  // (liveSessionStart never throws — Liveblocks failures are logged inside.)
+  await liveSessionStart(state);
+
   // The socket may have closed while the writes above were in flight; the
   // session row still exists and the close handler will mark it ended.
   if (ws.readyState === WebSocket.OPEN) {
@@ -204,12 +242,6 @@ async function handleAuth(
     `[tandem-server] session ${session.id} started ` +
       `(user ${msg.userId}, room ${msg.roomId})`
   );
-  const state: ConnectionState = {
-    userId: msg.userId,
-    roomId: msg.roomId,
-    sessionId: session.id,
-  };
-  await liveSessionStart(state);
   return state;
 }
 
@@ -236,6 +268,9 @@ async function handleEvent(state: ConnectionState, msg: EventMessage) {
   await liveSessionEvent(state, {
     eventType: msg.eventType,
     content: msg.content,
+    // Raw ANSI goes to the live layer only (xterm rendering); Supabase keeps
+    // the stripped form as the durable, searchable record.
+    ...(typeof msg.raw === "string" ? { raw: msg.raw } : {}),
     timestamp: msg.timestamp,
   });
 }
@@ -297,6 +332,90 @@ async function endSession(state: ConnectionState) {
       }
     }
   }
+}
+
+// ─── Remote control state (Stage 10) ─────────────────────────────────────────
+// SECURITY-CRITICAL. This server is the SOLE authority on who controls a
+// session. State is ephemeral by design (server memory, never Supabase); the
+// Liveblocks mirror is display-only and never consulted for authorization.
+// Every session_input message is re-verified against controlBySession — a
+// client-side claim of "I have control" is never trusted.
+
+interface ControlState {
+  controllerId: string;
+  roomId: string;
+  grantedAt: number;
+}
+interface PendingControlRequest {
+  requesterId: string;
+  roomId: string;
+  requestedAt: number;
+  timer: NodeJS.Timeout;
+}
+
+const controlBySession = new Map<string, ControlState>();
+const pendingBySession = new Map<string, PendingControlRequest>();
+/** Live CLI connection per active session — the only route for input. */
+const cliSocketBySession = new Map<string, WebSocket>();
+/** Open browser connections per user, for disconnect-triggered release. */
+const webSocketsByUser = new Map<string, Set<WebSocket>>();
+
+const CONTROL_REQUEST_TIMEOUT_MS = Number(
+  process.env.CONTROL_REQUEST_TIMEOUT_MS ?? 30_000
+);
+
+/** Display-only mirror of control state into the room's Liveblocks storage. */
+async function mirrorControl(
+  roomId: string,
+  sessionId: string,
+  fields: {
+    controllerId: string | null;
+    pendingRequesterId: string | null;
+    pendingRequestedAt: string | null;
+  }
+): Promise<void> {
+  if (!liveblocks) return;
+  try {
+    await liveblocks.mutateStorage(liveRoomId(roomId), ({ root }) => {
+      const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+      const session = sessions?.get(sessionId);
+      if (!session) return;
+      session.set("controllerId", fields.controllerId);
+      session.set("pendingRequesterId", fields.pendingRequesterId);
+      session.set("pendingRequestedAt", fields.pendingRequestedAt);
+    });
+  } catch (err) {
+    console.error(
+      `[tandem-server] liveblocks: failed to mirror control state for ` +
+        `${sessionId}: ${err instanceof Error ? err.message : err}`
+    );
+  }
+}
+
+function clearPendingRequest(sessionId: string): PendingControlRequest | undefined {
+  const pending = pendingBySession.get(sessionId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingBySession.delete(sessionId);
+  }
+  return pending;
+}
+
+/** Clears controller + any pending request; mirrors the reset. */
+async function releaseControl(sessionId: string, reason: string): Promise<void> {
+  const control = controlBySession.get(sessionId);
+  const pending = clearPendingRequest(sessionId);
+  if (!control && !pending) return;
+  controlBySession.delete(sessionId);
+  const roomId = (control ?? pending)!.roomId;
+  console.log(
+    `[tandem-server] control cleared for session ${sessionId} (${reason})`
+  );
+  await mirrorControl(roomId, sessionId, {
+    controllerId: null,
+    pendingRequesterId: null,
+    pendingRequestedAt: null,
+  });
 }
 
 // ─── Branch endpoint (Stage 5) ───────────────────────────────────────────────
@@ -657,12 +776,162 @@ async function handleChatCreate(
   sendJson(res, 200, { message });
 }
 
+// ─── Control endpoints (Stage 10) ────────────────────────────────────────────
+// request: any room member except the owner, when a session is active,
+//   connected, uncontrolled, and has no pending request. Expires after
+//   CONTROL_REQUEST_TIMEOUT_MS with no response.
+// approve/deny: session owner only (JWT identity must match sessions.user_id).
+// release: the current controller (releasing their own control) or the owner
+//   (revoking anyone's control at any time).
+
+async function handleControl(
+  res: import("node:http").ServerResponse,
+  sessionId: string,
+  action: string,
+  userId: string
+) {
+  const { data: session } = await supabase
+    .from("sessions")
+    .select("id, room_id, user_id, status")
+    .eq("id", sessionId)
+    .maybeSingle();
+  if (!session) return sendJson(res, 404, { error: "session not found" });
+
+  if (!(await isRoomMember(session.room_id, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+
+  const ownerId = session.user_id as string;
+  const roomId = session.room_id as string;
+  const control = controlBySession.get(sessionId);
+  const pending = pendingBySession.get(sessionId);
+
+  switch (action) {
+    case "request": {
+      if (userId === ownerId) {
+        return sendJson(res, 400, {
+          error: "you own this session — you always have control via local stdin",
+        });
+      }
+      if (session.status !== "active") {
+        return sendJson(res, 409, { error: "session is not active" });
+      }
+      if (!cliSocketBySession.has(sessionId)) {
+        return sendJson(res, 409, { error: "session has no live connection" });
+      }
+      if (control) {
+        return sendJson(res, 409, { error: "session is already being controlled" });
+      }
+      if (pending) {
+        return sendJson(res, 409, { error: "a control request is already pending" });
+      }
+
+      const requestedAt = Date.now();
+      const timer = setTimeout(() => {
+        const current = pendingBySession.get(sessionId);
+        if (current && current.requestedAt === requestedAt) {
+          pendingBySession.delete(sessionId);
+          console.log(
+            `[tandem-server] control request for session ${sessionId} ` +
+              `timed out (requester ${userId})`
+          );
+          void mirrorControl(roomId, sessionId, {
+            controllerId: null,
+            pendingRequesterId: null,
+            pendingRequestedAt: null,
+          });
+        }
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      pendingBySession.set(sessionId, {
+        requesterId: userId,
+        roomId,
+        requestedAt,
+        timer,
+      });
+      console.log(
+        `[tandem-server] control requested for session ${sessionId} by ${userId}`
+      );
+      await mirrorControl(roomId, sessionId, {
+        controllerId: null,
+        pendingRequesterId: userId,
+        pendingRequestedAt: new Date(requestedAt).toISOString(),
+      });
+      return sendJson(res, 200, { pending: true });
+    }
+
+    case "approve": {
+      if (userId !== ownerId) {
+        return sendJson(res, 403, { error: "only the session owner can approve" });
+      }
+      if (!pending) {
+        return sendJson(res, 409, { error: "no pending control request" });
+      }
+      clearPendingRequest(sessionId);
+      controlBySession.set(sessionId, {
+        controllerId: pending.requesterId,
+        roomId,
+        grantedAt: Date.now(),
+      });
+      console.log(
+        `[tandem-server] control of session ${sessionId} granted to ` +
+          `${pending.requesterId} by owner ${userId}`
+      );
+      await mirrorControl(roomId, sessionId, {
+        controllerId: pending.requesterId,
+        pendingRequesterId: null,
+        pendingRequestedAt: null,
+      });
+      return sendJson(res, 200, { controllerId: pending.requesterId });
+    }
+
+    case "deny": {
+      if (userId !== ownerId) {
+        return sendJson(res, 403, { error: "only the session owner can deny" });
+      }
+      if (!pending) {
+        return sendJson(res, 409, { error: "no pending control request" });
+      }
+      clearPendingRequest(sessionId);
+      console.log(
+        `[tandem-server] control request for session ${sessionId} denied by owner`
+      );
+      await mirrorControl(roomId, sessionId, {
+        controllerId: null,
+        pendingRequesterId: null,
+        pendingRequestedAt: null,
+      });
+      return sendJson(res, 200, { denied: true });
+    }
+
+    case "release": {
+      const isController = !!control && control.controllerId === userId;
+      if (!isController && userId !== ownerId) {
+        return sendJson(res, 403, {
+          error: "only the current controller or the session owner can release",
+        });
+      }
+      // Idempotent: releasing when nothing is held is a no-op success.
+      await releaseControl(
+        sessionId,
+        userId === ownerId ? `revoked by owner ${userId}` : `released by controller`
+      );
+      return sendJson(res, 200, { released: true });
+    }
+
+    default:
+      return sendJson(res, 404, { error: "not found" });
+  }
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 const UUID = "[0-9a-fA-F-]{36}";
 const MEMORY_COLLECTION = new RegExp(`^/rooms/(${UUID})/memory$`);
 const MEMORY_ENTRY = new RegExp(`^/rooms/(${UUID})/memory/(${UUID})$`);
 const CHAT_COLLECTION = new RegExp(`^/rooms/(${UUID})/chat$`);
+const CONTROL_ACTION = new RegExp(
+  `^/sessions/(${UUID})/control/(request|approve|deny|release)$`
+);
 
 const httpServer = createServer((req, res) => {
   const route = async () => {
@@ -670,6 +939,13 @@ const httpServer = createServer((req, res) => {
 
     if (req.method === "POST" && url === "/branch") {
       return handleBranch(req, res);
+    }
+
+    const controlMatch = url.match(CONTROL_ACTION);
+    if (controlMatch && req.method === "POST") {
+      const userId = await authUser(req, res);
+      if (!userId) return;
+      return handleControl(res, controlMatch[1], controlMatch[2], userId);
     }
 
     const collection = url.match(MEMORY_COLLECTION);
@@ -722,8 +998,62 @@ setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL_MS);
 
+/** Browser connection auth: verifies identity + membership. Creates NO
+    session row — web connections exist only to carry control input. */
+async function handleWebAuth(
+  ws: WebSocket,
+  msg: AuthMessage
+): Promise<string | null> {
+  const { data, error } = await supabase.auth.getUser(msg.token);
+  if (error || !data.user) {
+    ws.close(CLOSE_AUTH_FAILED, "invalid token");
+    return null;
+  }
+  if (data.user.id !== msg.userId) {
+    ws.close(CLOSE_AUTH_FAILED, "token does not match userId");
+    return null;
+  }
+  if (!(await isRoomMember(msg.roomId, msg.userId))) {
+    ws.close(CLOSE_AUTH_FAILED, "not a member of this room");
+    return null;
+  }
+  let set = webSocketsByUser.get(msg.userId);
+  if (!set) {
+    set = new Set();
+    webSocketsByUser.set(msg.userId, set);
+  }
+  set.add(ws);
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "auth_ok" }));
+  }
+  return msg.userId;
+}
+
+/** SECURITY-CRITICAL: re-verify the sender against the CURRENT controller in
+    server memory on EVERY message. Unauthorized input is silently dropped
+    (logged server-side) so control state is not leaked to probers. */
+function handleSessionInput(webUserId: string, msg: SessionInputMessage): void {
+  if (typeof msg.sessionId !== "string" || typeof msg.content !== "string") {
+    return;
+  }
+  if (msg.content.length > 4096) return; // keystrokes, not payload dumps
+  const control = controlBySession.get(msg.sessionId);
+  if (!control || control.controllerId !== webUserId) {
+    console.warn(
+      `[tandem-server] dropped session_input from ${webUserId} for session ` +
+        `${msg.sessionId} — not the current controller`
+    );
+    return;
+  }
+  const cliWs = cliSocketBySession.get(msg.sessionId);
+  if (cliWs && cliWs.readyState === WebSocket.OPEN) {
+    cliWs.send(JSON.stringify({ type: "input", content: msg.content }));
+  }
+}
+
 wss.on("connection", (ws) => {
   let state: ConnectionState | null = null;
+  let webUserId: string | null = null;
 
   aliveSockets.add(ws);
   ws.on("pong", () => aliveSockets.add(ws));
@@ -747,12 +1077,27 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (!state) {
+      if (!state && !webUserId) {
         if (msg.type !== "auth") {
           ws.close(CLOSE_PROTOCOL_ERROR, "expected auth message first");
           return;
         }
-        state = await handleAuth(ws, msg);
+        if (msg.role === "web") {
+          webUserId = await handleWebAuth(ws, msg);
+        } else {
+          // handleAuth registers the socket in cliSocketBySession itself,
+          // before sending auth_ok (avoids a control-request race).
+          state = await handleAuth(ws, msg);
+        }
+        return;
+      }
+
+      if (webUserId) {
+        if (msg.type !== "session_input") {
+          ws.close(CLOSE_PROTOCOL_ERROR, `unexpected message type: ${msg.type}`);
+          return;
+        }
+        handleSessionInput(webUserId, msg);
         return;
       }
 
@@ -760,15 +1105,33 @@ wss.on("connection", (ws) => {
         ws.close(CLOSE_PROTOCOL_ERROR, `unexpected message type: ${msg.type}`);
         return;
       }
-      await handleEvent(state, msg);
+      await handleEvent(state!, msg);
     });
   });
 
   ws.on("close", () => {
     queue = queue.then(async () => {
       if (state) {
+        // Session over: nothing left to control.
+        cliSocketBySession.delete(state.sessionId);
+        await releaseControl(state.sessionId, "session CLI disconnected");
         await endSession(state);
         state = null;
+      }
+      if (webUserId) {
+        const set = webSocketsByUser.get(webUserId);
+        set?.delete(ws);
+        if (set && set.size === 0) {
+          webSocketsByUser.delete(webUserId);
+          // Controller's last browser connection is gone — auto-release
+          // every session they were controlling.
+          for (const [sessionId, control] of controlBySession) {
+            if (control.controllerId === webUserId) {
+              await releaseControl(sessionId, "controller browser disconnected");
+            }
+          }
+        }
+        webUserId = null;
       }
     });
   });

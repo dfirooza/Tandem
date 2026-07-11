@@ -1,7 +1,15 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { branchSession } from './actions'
+import {
+  branchSession,
+  requestControl,
+  approveControl,
+  denyControl,
+  releaseControl,
+} from './actions'
+import SessionTerminal from './terminal'
+import { useControlSocket } from './control-socket'
 import { LiveList, LiveMap } from '@liveblocks/client'
 import {
   LiveblocksProvider,
@@ -188,42 +196,233 @@ function PanelHeader({
   )
 }
 
+/** Seconds remaining toward the 30s control-request timeout. */
+function Countdown({ since }: { since: string }) {
+  const compute = () =>
+    Math.max(0, 30 - Math.floor((Date.now() - new Date(since).getTime()) / 1000))
+  const [remaining, setRemaining] = useState(compute)
+  useEffect(() => {
+    const t = setInterval(() => setRemaining(compute()), 500)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [since])
+  return <span className="font-mono">{remaining}s</span>
+}
+
+/**
+ * Control state UI for an active session. Purely reflects the server's
+ * Liveblocks mirror; every action goes through tandem-server, which is the
+ * sole authority (this UI cannot grant anything by itself).
+ */
+function ControlBar({
+  sessionId,
+  isOwner,
+  selfId,
+  controllerId,
+  pendingRequesterId,
+  pendingRequestedAt,
+  emailById,
+}: {
+  sessionId: string
+  isOwner: boolean
+  selfId: string
+  controllerId: string | null | undefined
+  pendingRequesterId: string | null | undefined
+  pendingRequestedAt: string | null | undefined
+  emailById: Record<string, string>
+}) {
+  const [busy, setBusy] = useState(false)
+
+  async function act(fn: (id: string) => Promise<{ ok?: true; error?: string }>) {
+    if (busy) return
+    setBusy(true)
+    const result = await fn(sessionId)
+    setBusy(false)
+    if (result.error) alert(`Control action failed: ${result.error}`)
+  }
+
+  const btn = 'btn-ghost px-2 py-0.5 text-xs disabled:cursor-wait disabled:opacity-50'
+  const btnPrimary =
+    'btn-primary px-2 py-0.5 text-xs disabled:cursor-wait disabled:opacity-50'
+
+  if (controllerId) {
+    const mine = controllerId === selfId
+    return (
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+        <span className={mine ? 'text-accent' : 'text-warning'}>
+          {mine
+            ? 'You have control of this session'
+            : `Controlled by ${emailById[controllerId] ?? controllerId}`}
+        </span>
+        {mine && (
+          <button className={btn} disabled={busy} onClick={() => act(releaseControl)}>
+            Release control
+          </button>
+        )}
+        {isOwner && !mine && (
+          <button className={btn} disabled={busy} onClick={() => act(releaseControl)}>
+            Revoke control
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  if (pendingRequesterId) {
+    if (isOwner) {
+      return (
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-warning">
+            {emailById[pendingRequesterId] ?? pendingRequesterId} requests control
+            {pendingRequestedAt && (
+              <>
+                {' '}
+                (<Countdown since={pendingRequestedAt} />)
+              </>
+            )}
+          </span>
+          <button
+            className={btnPrimary}
+            disabled={busy}
+            onClick={() => act(approveControl)}
+          >
+            Approve
+          </button>
+          <button className={btn} disabled={busy} onClick={() => act(denyControl)}>
+            Deny
+          </button>
+        </div>
+      )
+    }
+    if (pendingRequesterId === selfId) {
+      return (
+        <p className="mb-2 text-xs text-muted">
+          Control requested — waiting for the owner to approve
+          {pendingRequestedAt && (
+            <>
+              {' '}
+              (<Countdown since={pendingRequestedAt} />)
+            </>
+          )}
+          . If this disappears without granting, the request was denied or timed
+          out.
+        </p>
+      )
+    }
+    return <p className="mb-2 text-xs text-muted">A control request is pending…</p>
+  }
+
+  if (!isOwner) {
+    return (
+      <div className="mb-2">
+        <button className={btn} disabled={busy} onClick={() => act(requestControl)}>
+          Request control
+        </button>
+      </div>
+    )
+  }
+
+  return null
+}
+
 function SessionPanel({
   sessionId,
   session,
   email,
   parentEmail,
+  selfId,
+  emailById,
 }: {
   sessionId: string
   session: {
     userId: string
     status: string
     parentSessionId?: string | null
-    events: readonly { eventType: string; content: string; timestamp: string }[]
+    controllerId?: string | null
+    pendingRequesterId?: string | null
+    pendingRequestedAt?: string | null
+    events: readonly {
+      eventType: string
+      content: string
+      raw?: string
+      timestamp: string
+    }[]
   }
   email: string
   parentEmail: string | null
+  selfId: string
+  emailById: Record<string, string>
 }) {
   const outputRef = useRef<HTMLPreElement>(null)
+  const { sendInput } = useControlSocket()
+  const [branching, setBranching] = useState(false)
 
-  // Auto-scroll smoothly to the newest output as events stream in.
+  // Branched sessions are static copies — "active" but with no CLI process
+  // behind them (until live branch continuation is built), so they get the
+  // text view and no control UI. Only real, connected sessions get xterm +
+  // remote control.
+  const isLiveSession = session.status === 'active' && !session.parentSessionId
+  const hasControl = isLiveSession && session.controllerId === selfId
+
+  // Auto-scroll smoothly to the newest output as events stream in
+  // (text panels only — xterm manages its own scrollback).
   useEffect(() => {
     const el = outputRef.current
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [session.events.length])
 
+  async function branchNow() {
+    if (branching || session.events.length === 0) return
+    setBranching(true)
+    const result = await branchSession(sessionId, session.events.length)
+    setBranching(false)
+    if (result.error) alert(`Branch failed: ${result.error}`)
+  }
+
   return (
     <div className={PANEL_CLASS}>
-      <PanelHeader
-        email={email}
-        status={session.status}
-        sessionId={sessionId}
-        parentSessionId={session.parentSessionId}
-        parentEmail={parentEmail}
-      />
-      <pre ref={outputRef} className={OUTPUT_CLASS}>
-        <EventSpans sessionId={sessionId} events={session.events} />
-      </pre>
+      <div className="flex items-start justify-between gap-2">
+        <PanelHeader
+          email={email}
+          status={session.status}
+          sessionId={sessionId}
+          parentSessionId={session.parentSessionId}
+          parentEmail={parentEmail}
+        />
+        {isLiveSession && session.events.length > 0 && (
+          <button
+            onClick={branchNow}
+            disabled={branching}
+            title="Branch a new session from the current point"
+            className="btn-ghost shrink-0 px-2 py-0.5 text-xs disabled:cursor-wait disabled:opacity-50"
+          >
+            ⑂ {branching ? 'branching…' : 'branch'}
+          </button>
+        )}
+      </div>
+
+      {isLiveSession ? (
+        <>
+          <ControlBar
+            sessionId={sessionId}
+            isOwner={session.userId === selfId}
+            selfId={selfId}
+            controllerId={session.controllerId}
+            pendingRequesterId={session.pendingRequesterId}
+            pendingRequestedAt={session.pendingRequestedAt}
+            emailById={emailById}
+          />
+          <SessionTerminal
+            events={session.events}
+            interactive={hasControl}
+            onInput={(data) => sendInput(sessionId, data)}
+          />
+        </>
+      ) : (
+        <pre ref={outputRef} className={OUTPUT_CLASS}>
+          <EventSpans sessionId={sessionId} events={session.events} />
+        </pre>
+      )}
     </div>
   )
 }
@@ -240,10 +439,12 @@ function SessionPanels({
   emailById,
   historySessions,
   ownerBySessionId,
+  selfId,
 }: {
   emailById: Record<string, string>
   historySessions: HistorySession[]
   ownerBySessionId: Record<string, string>
+  selfId: string
 }) {
   const sessions = useStorage((root) => root.sessions)
 
@@ -306,6 +507,8 @@ function SessionPanels({
           session={session}
           email={emailById[session.userId] ?? session.userId}
           parentEmail={parentEmailFor(session.parentSessionId)}
+          selfId={selfId}
+          emailById={emailById}
         />
       ))}
     </div>
@@ -357,10 +560,12 @@ export default function LiveSessionSection({
   emailById,
   historySessions,
   ownerBySessionId,
+  selfId,
 }: {
   emailById: Record<string, string>
   historySessions: HistorySession[]
   ownerBySessionId: Record<string, string>
+  selfId: string
 }) {
   return (
     <section>
@@ -371,6 +576,7 @@ export default function LiveSessionSection({
           emailById={emailById}
           historySessions={historySessions}
           ownerBySessionId={ownerBySessionId}
+          selfId={selfId}
         />
       </CursorTracking>
     </section>

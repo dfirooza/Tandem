@@ -19,7 +19,18 @@ declare global {
           status: string
           /** Set when the session was branched from another (Stage 5). */
           parentSessionId?: string | null
-          events: LiveList<{ eventType: string; content: string; timestamp: string }>
+          /** Remote-control mirror (Stage 10) — display only; tandem-server
+              memory is the sole authority on control. */
+          controllerId?: string | null
+          pendingRequesterId?: string | null
+          pendingRequestedAt?: string | null
+          events: LiveList<{
+            eventType: string
+            content: string
+            /** Raw PTY output (ANSI intact) for xterm rendering. */
+            raw?: string
+            timestamp: string
+          }>
         }>
       >
       /** Team chat (Stage 9). Absent in rooms created before this stage. */

@@ -73,6 +73,44 @@ export async function pinMemory(roomId: string, formData: FormData) {
   revalidatePath(`/rooms/${roomId}`)
 }
 
+// ─── Remote session control (Stage 10) ───────────────────────────────────────
+// All four verbs relay to tandem-server, which is the sole authority on
+// control state. The input path itself is a browser WebSocket (see
+// control-socket.tsx) — these actions only manage grants.
+
+async function controlAction(
+  sessionId: string,
+  action: 'request' | 'approve' | 'deny' | 'release'
+): Promise<{ ok?: true; error?: string }> {
+  const token = await accessToken()
+  if (!token) return { error: 'not signed in' }
+
+  try {
+    const res = await fetch(
+      `${TANDEM_SERVER()}/sessions/${sessionId}/control/${action}`,
+      { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+    )
+    const json = (await res.json().catch(() => ({}))) as { error?: string }
+    if (!res.ok) return { error: json.error ?? `tandem-server returned ${res.status}` }
+    return { ok: true }
+  } catch {
+    return { error: 'could not reach tandem-server — is it running?' }
+  }
+}
+
+export async function requestControl(sessionId: string) {
+  return controlAction(sessionId, 'request')
+}
+export async function approveControl(sessionId: string) {
+  return controlAction(sessionId, 'approve')
+}
+export async function denyControl(sessionId: string) {
+  return controlAction(sessionId, 'deny')
+}
+export async function releaseControl(sessionId: string) {
+  return controlAction(sessionId, 'release')
+}
+
 // ─── Team chat (Stage 9) ─────────────────────────────────────────────────────
 // Same relay pattern: tandem-server does the durable insert + Liveblocks
 // mirror. No revalidate needed — the message arrives live via Liveblocks.

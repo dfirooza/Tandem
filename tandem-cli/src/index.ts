@@ -93,7 +93,14 @@ const MAX_BACKOFF_MS = 30_000;
 // mid-reconnect), flushed into the (new) session once one is established.
 // Bounded so an extended outage cannot grow memory without limit.
 const MAX_PENDING_EVENTS = 5_000;
-const pendingEvents: { content: string; timestamp: string }[] = [];
+const pendingEvents: { content: string; raw: string; timestamp: string }[] = [];
+
+// Remote input sink (Stage 10): the server forwards { type: "input" }
+// messages when a room member has been granted control of this session.
+// The server is the trusted source — it verifies the actual sender's
+// identity against the current controller before forwarding anything, so
+// the CLI writes input to the PTY exactly as if it were local stdin.
+let remoteInput: ((data: string) => void) | null = null;
 
 // Application close codes from tandem-server that a retry cannot fix
 // (bad/expired token, protocol violation). Retrying would just loop.
@@ -135,10 +142,14 @@ function connect() {
   });
 
   socket.on("message", (raw) => {
-    let msg: { type?: string; sessionId?: string };
+    let msg: { type?: string; sessionId?: string; content?: string };
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      return;
+    }
+    if (msg.type === "input" && typeof msg.content === "string") {
+      remoteInput?.(msg.content);
       return;
     }
     if (msg.type === "auth_ok" && typeof msg.sessionId === "string") {
@@ -154,7 +165,7 @@ function connect() {
       }
       everHadSession = true;
       for (const event of pendingEvents.splice(0)) {
-        sendEvent(event.content, event.timestamp);
+        sendEvent(event.content, event.raw, event.timestamp);
       }
     }
   });
@@ -203,11 +214,11 @@ function handleDrop(socket: WebSocket | null, reason: string) {
 
 connect();
 
-function sendEvent(content: string, timestamp: string) {
+function sendEvent(content: string, raw: string, timestamp: string) {
   if (wireState === "dead") return;
   if (wireState !== "ready" || !ws || !sessionId) {
     if (pendingEvents.length >= MAX_PENDING_EVENTS) pendingEvents.shift();
-    pendingEvents.push({ content, timestamp });
+    pendingEvents.push({ content, raw, timestamp });
     return;
   }
   ws.send(
@@ -215,7 +226,10 @@ function sendEvent(content: string, timestamp: string) {
       type: "event",
       sessionId,
       eventType: "output",
+      // Stripped content is the durable record; raw (ANSI intact) feeds the
+      // live terminal rendering in the web app.
       content,
+      raw,
       timestamp,
     })
   );
@@ -318,8 +332,12 @@ ptyProcess.onData((data) => {
   process.stdout.write(data);
   const stripped = stripAnsi(data);
   capturedChunks.push({ raw: data, stripped, timestamp: Date.now() });
-  sendEvent(stripped, new Date().toISOString());
+  sendEvent(stripped, data, new Date().toISOString());
 });
+
+// Remote control (Stage 10): server-forwarded input goes straight to the
+// PTY, same as local stdin. Local stdin below is untouched and always works.
+remoteInput = (data) => ptyProcess.write(data);
 
 // Forward the user's keystrokes to the PTY. Raw mode so control keys
 // (arrows, Ctrl+C, etc.) reach Claude Code instead of being interpreted here.
@@ -336,6 +354,7 @@ process.stdout.on("resize", () => {
 });
 
 ptyProcess.onExit(({ exitCode }) => {
+  remoteInput = null;
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(false);
   }

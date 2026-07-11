@@ -29,17 +29,24 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 9 complete: team chat added. Room members send text messages via 
-a POST /rooms/:roomId/chat endpoint on tandem-server (durable Supabase 
-insert, mirrored to a Liveblocks chatMessages LiveList). Chat panel 
-lives as a sticky right-side column in the room view, sharing one 
-RoomRealtime provider with sessions/presence/cursors (avoids duplicate 
-Liveblocks connections). Confirmed working: cross-account live message 
-delivery and durability across page refresh, both verified by the user 
-directly.
-Next: turn-based session takeover, then auto-summarized shared context 
-+ compact UI redesign (the two hardest remaining items from the user's 
-Jul 10 feature list).
+Stage 10 complete: turn-based remote session control. Any room member 
+can request control of a teammate's active session; the owner (if 
+present in the room) approves or denies via a 30s-timeout prompt. Once 
+granted, the controller gets real keystroke-level control through an 
+embedded xterm.js terminal, with input routed browser -> tandem-server 
+-> the owner's tandem-cli -> their local PTY. Control state lives only 
+in server memory (never Liveblocks, never trusted from client claims) 
+and is re-verified on every single input message. The owner's local 
+terminal stdin always works regardless of control state; the web panel's 
+input path is exclusively locked to whoever holds control. Auto-releases 
+on disconnect, CLI drop, timeout, deny, or explicit revoke. 24/24 e2e 
+tests including 4 dedicated security checks, all confirmed by the user 
+directly with two real accounts (request, approve, remote typing 
+reaching the real terminal, and the owner's web-panel input correctly 
+blocked while someone else controls). Known limitation: browser terminal 
+size is not synced to the owner's PTY dimensions (cosmetic, follow-up).
+Next: auto-summarized shared context + compact UI redesign — the last 
+remaining item from the user's Jul 10 feature list.
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

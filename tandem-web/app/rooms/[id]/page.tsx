@@ -4,6 +4,7 @@ import { signOut } from '@/app/auth/actions'
 import { pinMemory, deleteMemory } from './actions'
 import LiveSessionSection, { RoomRealtime } from './live'
 import ChatPanel from './chat'
+import ControlSocketProvider from './control-socket'
 
 export default async function RoomPage({
   params,
@@ -104,6 +105,7 @@ export default async function RoomPage({
 
   return (
     <RoomRealtime roomId={room.id} selfEmail={user.email ?? user.id}>
+      <ControlSocketProvider roomId={room.id} userId={user.id}>
       <div className="flex min-h-screen">
         <main className="min-w-0 flex-1 px-8 py-6">
           <header className="mb-6 flex items-center justify-between gap-4 border-b border-border pb-4">
@@ -198,6 +200,7 @@ export default async function RoomPage({
             emailById={emailById}
             historySessions={historySessions}
             ownerBySessionId={ownerBySessionId}
+            selfId={user.id}
           />
         </main>
 
@@ -208,6 +211,7 @@ export default async function RoomPage({
           history={chatHistory}
         />
       </div>
+      </ControlSocketProvider>
     </RoomRealtime>
   )
 }
