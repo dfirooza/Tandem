@@ -350,18 +350,40 @@ function readJsonBody(
   });
 }
 
+/** Verifies the request's bearer token; returns the userId or null. */
+async function authUser(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse
+): Promise<string | null> {
+  const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) {
+    sendJson(res, 401, { error: "missing bearer token" });
+    return null;
+  }
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) {
+    sendJson(res, 401, { error: "invalid token" });
+    return null;
+  }
+  return data.user.id;
+}
+
+async function isRoomMember(roomId: string, userId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from("room_members")
+    .select("user_id")
+    .eq("room_id", roomId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  return !!data;
+}
+
 async function handleBranch(
   req: import("node:http").IncomingMessage,
   res: import("node:http").ServerResponse
 ) {
-  const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-  if (!token) return sendJson(res, 401, { error: "missing bearer token" });
-
-  const { data: userData, error: userErr } = await supabase.auth.getUser(token);
-  if (userErr || !userData.user) {
-    return sendJson(res, 401, { error: "invalid token" });
-  }
-  const userId = userData.user.id;
+  const userId = await authUser(req, res);
+  if (!userId) return;
 
   let body: { sourceSessionId?: unknown; eventCount?: unknown };
   try {
@@ -389,13 +411,7 @@ async function handleBranch(
     .maybeSingle();
   if (!source) return sendJson(res, 404, { error: "source session not found" });
 
-  const { data: membership } = await supabase
-    .from("room_members")
-    .select("user_id")
-    .eq("room_id", source.room_id)
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (!membership) {
+  if (!(await isRoomMember(source.room_id, userId))) {
     return sendJson(res, 403, { error: "not a member of this room" });
   }
 
@@ -482,16 +498,125 @@ async function handleBranch(
   sendJson(res, 200, { sessionId: branch.id });
 }
 
-const httpServer = createServer((req, res) => {
-  if (req.method === "POST" && req.url === "/branch") {
-    handleBranch(req, res).catch((err) => {
-      console.error(`[tandem-server] branch failed: ${err?.message ?? err}`);
-      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
-    });
-    return;
+// ─── Memory endpoints (Stage 6) ──────────────────────────────────────────────
+// Pinned, durable, room-scoped notes. Manually curated (no AI extraction).
+// Same auth pattern as /branch: JWT-verified + membership-checked. RLS on
+// memory_entries mirrors these rules as defense in depth.
+
+async function handleMemoryList(
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
   }
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "not found" }));
+  const { data, error } = await supabase
+    .from("memory_entries")
+    .select("id, content, tags, pinned_by, created_at")
+    .eq("room_id", roomId)
+    .order("created_at", { ascending: false });
+  if (error) return sendJson(res, 500, { error: error.message });
+  sendJson(res, 200, { entries: data });
+}
+
+async function handleMemoryCreate(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+  let body: { content?: unknown; tags?: unknown };
+  try {
+    body = (await readJsonBody(req)) as typeof body;
+  } catch (err) {
+    return sendJson(res, 400, {
+      error: err instanceof Error ? err.message : "bad request",
+    });
+  }
+  const content = typeof body.content === "string" ? body.content.trim() : "";
+  const tags = Array.isArray(body.tags)
+    ? body.tags.filter((t): t is string => typeof t === "string" && t.length > 0)
+    : [];
+  if (!content) {
+    return sendJson(res, 400, { error: "content (non-empty string) required" });
+  }
+  const { data, error } = await supabase
+    .from("memory_entries")
+    .insert({ room_id: roomId, content, tags, pinned_by: userId })
+    .select("id, content, tags, pinned_by, created_at")
+    .single();
+  if (error) return sendJson(res, 500, { error: error.message });
+  console.log(`[tandem-server] memory ${data.id} pinned in room ${roomId}`);
+  sendJson(res, 200, { entry: data });
+}
+
+async function handleMemoryDelete(
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  entryId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+  const { data: entry } = await supabase
+    .from("memory_entries")
+    .select("id, pinned_by")
+    .eq("id", entryId)
+    .eq("room_id", roomId)
+    .maybeSingle();
+  if (!entry) return sendJson(res, 404, { error: "memory entry not found" });
+  if (entry.pinned_by !== userId) {
+    return sendJson(res, 403, {
+      error: "only the user who pinned an entry can delete it",
+    });
+  }
+  const { error } = await supabase.from("memory_entries").delete().eq("id", entryId);
+  if (error) return sendJson(res, 500, { error: error.message });
+  console.log(`[tandem-server] memory ${entryId} deleted from room ${roomId}`);
+  sendJson(res, 200, { deleted: true });
+}
+
+// ─── HTTP routing ────────────────────────────────────────────────────────────
+
+const UUID = "[0-9a-fA-F-]{36}";
+const MEMORY_COLLECTION = new RegExp(`^/rooms/(${UUID})/memory$`);
+const MEMORY_ENTRY = new RegExp(`^/rooms/(${UUID})/memory/(${UUID})$`);
+
+const httpServer = createServer((req, res) => {
+  const route = async () => {
+    const url = (req.url ?? "").split("?")[0];
+
+    if (req.method === "POST" && url === "/branch") {
+      return handleBranch(req, res);
+    }
+
+    const collection = url.match(MEMORY_COLLECTION);
+    const entry = url.match(MEMORY_ENTRY);
+    if (collection || entry) {
+      const userId = await authUser(req, res);
+      if (!userId) return;
+      if (collection && req.method === "GET") {
+        return handleMemoryList(res, collection[1], userId);
+      }
+      if (collection && req.method === "POST") {
+        return handleMemoryCreate(req, res, collection[1], userId);
+      }
+      if (entry && req.method === "DELETE") {
+        return handleMemoryDelete(res, entry[1], entry[2], userId);
+      }
+    }
+
+    sendJson(res, 404, { error: "not found" });
+  };
+  route().catch((err) => {
+    console.error(`[tandem-server] http error: ${err?.message ?? err}`);
+    if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+  });
 });
 
 const wss = new WebSocketServer({ server: httpServer });

@@ -2,6 +2,7 @@ import { redirect, notFound } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 import { signOut } from '@/app/auth/actions'
+import { pinMemory, deleteMemory } from './actions'
 import LiveSessionSection from './live'
 
 export default async function RoomPage({
@@ -76,6 +77,16 @@ export default async function RoomPage({
     (dbSessions ?? []).map((s) => [s.id, s.user_id])
   )
 
+  // Project memory (Stage 6): reads via RLS; pin/delete go through
+  // tandem-server (see actions.ts).
+  const { data: memoryEntries } = await supabase
+    .from('memory_entries')
+    .select('id, content, tags, pinned_by, created_at')
+    .eq('room_id', id)
+    .order('created_at', { ascending: false })
+
+  const pinMemoryForRoom = pinMemory.bind(null, id)
+
   return (
     <main>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -105,6 +116,77 @@ export default async function RoomPage({
           </li>
         ))}
       </ul>
+
+      <section>
+        <h2>Project Memory</h2>
+        <form action={pinMemoryForRoom} style={{ marginBottom: '1rem' }}>
+          <textarea
+            name="content"
+            required
+            placeholder="Pin a decision, convention, or piece of context…"
+            rows={3}
+            style={{ display: 'block', width: '100%', maxWidth: '40rem' }}
+          />
+          <input
+            name="tags"
+            placeholder="tags, comma, separated (optional)"
+            style={{ margin: '0.5rem 0.5rem 0 0', width: '20rem' }}
+          />
+          <button type="submit">Pin</button>
+        </form>
+
+        {(memoryEntries ?? []).length === 0 ? (
+          <p style={{ color: '#555' }}>No memory pinned yet.</p>
+        ) : (
+          <ul style={{ listStyle: 'none', padding: 0 }}>
+            {(memoryEntries ?? []).map((entry) => (
+              <li
+                key={entry.id}
+                style={{
+                  border: '1px solid #ccc',
+                  borderRadius: 4,
+                  padding: '0.5rem',
+                  marginBottom: '0.5rem',
+                }}
+              >
+                <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{entry.content}</p>
+                <p style={{ margin: '0.25rem 0 0', color: '#555', fontSize: '0.8rem' }}>
+                  {(entry.tags ?? []).length > 0 && (
+                    <span>
+                      {(entry.tags as string[]).map((t) => (
+                        <span
+                          key={t}
+                          className="code"
+                          style={{ marginRight: '0.3rem', fontSize: '0.75rem' }}
+                        >
+                          {t}
+                        </span>
+                      ))}
+                      {' · '}
+                    </span>
+                  )}
+                  pinned by {emailById[entry.pinned_by] ?? entry.pinned_by} ·{' '}
+                  {new Date(entry.created_at).toLocaleString()}
+                  {entry.pinned_by === user.id && (
+                    <>
+                      {' · '}
+                      <button
+                        formAction={deleteMemory.bind(null, id, entry.id)}
+                        form={`delete-${entry.id}`}
+                        type="submit"
+                        style={{ fontSize: '0.75rem' }}
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </p>
+                {entry.pinned_by === user.id && <form id={`delete-${entry.id}`} />}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <LiveSessionSection
         roomId={room.id}

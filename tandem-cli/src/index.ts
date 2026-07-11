@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as pty from "node-pty";
 import stripAnsi from "strip-ansi";
 import WebSocket from "ws";
@@ -219,8 +221,82 @@ function sendEvent(content: string, timestamp: string) {
   );
 }
 
+// ─── Room memory injection (Stage 6) ─────────────────────────────────────────
+// One-time fetch at startup: pull the room's pinned memory from tandem-server
+// and write it into a local context file so Claude Code picks it up
+// automatically. Never blocks the session: on any failure we warn and launch
+// normally. Never clobbers an existing CLAUDE.md — those are the user's own
+// project instructions.
+
+interface MemoryEntry {
+  content: string;
+  tags?: string[];
+}
+
+async function fetchAndWriteMemory(): Promise<void> {
+  // The WS URL doubles as the HTTP base (ws->http, wss->https).
+  const httpUrl = serverUrl!.replace(/^ws/i, "http");
+  let entries: MemoryEntry[];
+  try {
+    const res = await fetch(`${httpUrl}/rooms/${roomId}/memory`, {
+      headers: { Authorization: `Bearer ${userToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const json = (await res.json()) as { entries?: MemoryEntry[] };
+    entries = Array.isArray(json.entries) ? json.entries : [];
+  } catch (err) {
+    process.stderr.write(
+      `[tandem] warning: could not fetch room memory ` +
+        `(${err instanceof Error ? err.message : err}). ` +
+        `Launching without it.\n`
+    );
+    return;
+  }
+  if (entries.length === 0) return;
+
+  const body = [
+    "# Tandem Room Memory",
+    "",
+    `Auto-generated from this Tandem room's pinned memory ` +
+      `(${new Date().toISOString()}). Treat these as project context and ` +
+      `conventions pinned by the team.`,
+    "",
+    ...entries.map((e) => {
+      const tags = e.tags?.length ? ` _(tags: ${e.tags.join(", ")})_` : "";
+      // Indent continuation lines so multi-line entries stay one bullet.
+      return `- ${String(e.content).replace(/\r?\n/g, "\n  ")}${tags}`;
+    }),
+    "",
+  ].join("\n");
+
+  const claudeMdExists = fs.existsSync(path.join(process.cwd(), "CLAUDE.md"));
+  const target = claudeMdExists ? "TANDEM_MEMORY.md" : "CLAUDE.md";
+  try {
+    fs.writeFileSync(path.join(process.cwd(), target), body);
+  } catch (err) {
+    process.stderr.write(
+      `[tandem] warning: could not write ${target} ` +
+        `(${err instanceof Error ? err.message : err}). Launching without it.\n`
+    );
+    return;
+  }
+  if (claudeMdExists) {
+    process.stderr.write(
+      `[tandem] a CLAUDE.md already exists here, so room memory was written ` +
+        `to TANDEM_MEMORY.md instead (${entries.length} entries). Reference ` +
+        `it manually — Tandem never overwrites your project instructions.\n`
+    );
+  } else {
+    process.stderr.write(
+      `[tandem] wrote ${entries.length} pinned memory entries to CLAUDE.md\n`
+    );
+  }
+}
+
 // ─── PTY ─────────────────────────────────────────────────────────────────────
 
+function startPty(): void {
 // On Windows the target is often a .cmd shim (e.g. npm-installed `claude`),
 // which ConPTY's CreateProcess won't resolve on its own — route through cmd.exe.
 const isWindows = process.platform === "win32";
@@ -295,3 +371,10 @@ ptyProcess.onExit(({ exitCode }) => {
     process.exit(exitCode);
   }
 });
+}
+
+// Fetch memory first (bounded at 5s, never fatal), then launch the session.
+void (async () => {
+  await fetchAndWriteMemory();
+  startPty();
+})();
