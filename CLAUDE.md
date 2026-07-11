@@ -29,16 +29,17 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 8 complete: tandem-web restructured into a persistent sidebar app 
-shell (Tandem wordmark + rooms list on the left, main content area on 
-the right) replacing the single-column page layout. Restyled to a 
-sharper monochrome-plus-one-accent direction: true near-black 
-background, hairline borders, 6px sharp corners, blue (#3291FF range) 
-reserved for active status, primary actions, links, and accents only. 
-All Stage 0-6 functionality confirmed working within the new shell.
-Next: team chat, then turn-based session takeover, then live 
-auto-summarized shared context (the harder remaining items from the 
-user's Jul 10 feature list).
+Stage 9 complete: team chat added. Room members send text messages via 
+a POST /rooms/:roomId/chat endpoint on tandem-server (durable Supabase 
+insert, mirrored to a Liveblocks chatMessages LiveList). Chat panel 
+lives as a sticky right-side column in the room view, sharing one 
+RoomRealtime provider with sessions/presence/cursors (avoids duplicate 
+Liveblocks connections). Confirmed working: cross-account live message 
+delivery and durability across page refresh, both verified by the user 
+directly.
+Next: turn-based session takeover, then auto-summarized shared context 
++ compact UI redesign (the two hardest remaining items from the user's 
+Jul 10 feature list).
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

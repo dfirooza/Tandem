@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { branchSession } from './actions'
-import { LiveMap } from '@liveblocks/client'
+import { LiveList, LiveMap } from '@liveblocks/client'
 import {
   LiveblocksProvider,
   RoomProvider,
@@ -312,51 +312,67 @@ function SessionPanels({
   )
 }
 
-export default function LiveSessionSection({
+/**
+ * Shared Liveblocks room context for everything live on the room page
+ * (session panels, presence, cursors, chat). One provider = one connection =
+ * one presence entry per tab; mounting separate RoomProviders per panel
+ * would double-count presence.
+ */
+export function RoomRealtime({
   roomId,
   selfEmail,
-  emailById,
-  historySessions,
-  ownerBySessionId,
+  children,
 }: {
   roomId: string
   selfEmail: string
-  emailById: Record<string, string>
-  historySessions: HistorySession[]
-  ownerBySessionId: Record<string, string>
+  children: React.ReactNode
 }) {
   const publicKey = process.env.NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY
 
   if (!publicKey) {
+    // Misconfiguration: without the key none of the live features (or the
+    // components calling Liveblocks hooks) can render.
     return (
-      <section>
-        <h2 className="section-title">Live Sessions</h2>
-        <p className="error max-w-none">
-          NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY is not set — live sessions are disabled.
-        </p>
-      </section>
+      <p className="error m-8 max-w-none">
+        NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY is not set — live sessions and chat
+        are disabled.
+      </p>
     )
   }
 
   return (
+    <LiveblocksProvider publicApiKey={publicKey}>
+      <RoomProvider
+        id={`tandem-room-${roomId}`}
+        initialPresence={{ email: selfEmail, cursor: null }}
+        initialStorage={{ sessions: new LiveMap(), chatMessages: new LiveList([]) }}
+      >
+        {children}
+      </RoomProvider>
+    </LiveblocksProvider>
+  )
+}
+
+export default function LiveSessionSection({
+  emailById,
+  historySessions,
+  ownerBySessionId,
+}: {
+  emailById: Record<string, string>
+  historySessions: HistorySession[]
+  ownerBySessionId: Record<string, string>
+}) {
+  return (
     <section>
       <h2 className="section-title">Live Sessions</h2>
-      <LiveblocksProvider publicApiKey={publicKey}>
-        <RoomProvider
-          id={`tandem-room-${roomId}`}
-          initialPresence={{ email: selfEmail, cursor: null }}
-          initialStorage={{ sessions: new LiveMap() }}
-        >
-          <CursorTracking>
-            <PresenceList />
-            <SessionPanels
-              emailById={emailById}
-              historySessions={historySessions}
-              ownerBySessionId={ownerBySessionId}
-            />
-          </CursorTracking>
-        </RoomProvider>
-      </LiveblocksProvider>
+      <CursorTracking>
+        <PresenceList />
+        <SessionPanels
+          emailById={emailById}
+          historySessions={historySessions}
+          ownerBySessionId={ownerBySessionId}
+        />
+      </CursorTracking>
     </section>
   )
 }

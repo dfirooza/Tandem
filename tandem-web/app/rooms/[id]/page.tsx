@@ -2,7 +2,8 @@ import { redirect, notFound } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
 import { signOut } from '@/app/auth/actions'
 import { pinMemory, deleteMemory } from './actions'
-import LiveSessionSection from './live'
+import LiveSessionSection, { RoomRealtime } from './live'
+import ChatPanel from './chat'
 
 export default async function RoomPage({
   params,
@@ -86,9 +87,26 @@ export default async function RoomPage({
 
   const pinMemoryForRoom = pinMemory.bind(null, id)
 
+  // Chat history (Stage 9): durable messages via RLS; live updates arrive
+  // through Liveblocks in the ChatPanel.
+  const { data: chatRows } = await supabase
+    .from('chat_messages')
+    .select('id, user_id, content, created_at')
+    .eq('room_id', id)
+    .order('created_at', { ascending: true })
+
+  const chatHistory = (chatRows ?? []).map((m) => ({
+    id: m.id,
+    userId: m.user_id,
+    content: m.content,
+    timestamp: m.created_at,
+  }))
+
   return (
-    <main className="mx-auto w-full max-w-5xl px-8 py-6">
-      <header className="mb-6 flex items-center justify-between gap-4 border-b border-border pb-4">
+    <RoomRealtime roomId={room.id} selfEmail={user.email ?? user.id}>
+      <div className="flex min-h-screen">
+        <main className="min-w-0 flex-1 px-8 py-6">
+          <header className="mb-6 flex items-center justify-between gap-4 border-b border-border pb-4">
         <div className="flex items-baseline gap-3">
           <h1 className="m-0">{room.name}</h1>
           <span className="code" title="Share this invite code with teammates">
@@ -176,13 +194,20 @@ export default async function RoomPage({
         )}
       </section>
 
-      <LiveSessionSection
-        roomId={room.id}
-        selfEmail={user.email ?? user.id}
-        emailById={emailById}
-        historySessions={historySessions}
-        ownerBySessionId={ownerBySessionId}
-      />
-    </main>
+          <LiveSessionSection
+            emailById={emailById}
+            historySessions={historySessions}
+            ownerBySessionId={ownerBySessionId}
+          />
+        </main>
+
+        <ChatPanel
+          roomId={room.id}
+          selfId={user.id}
+          emailById={emailById}
+          history={chatHistory}
+        />
+      </div>
+    </RoomRealtime>
   )
 }

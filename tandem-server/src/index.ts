@@ -581,11 +581,88 @@ async function handleMemoryDelete(
   sendJson(res, 200, { deleted: true });
 }
 
+// ─── Chat endpoint (Stage 9) ─────────────────────────────────────────────────
+// Human-to-human room chat, separate from AI session content. Same pattern
+// as memory: durable insert into Supabase first, then mirrored into the
+// room's Liveblocks storage (a chatMessages LiveList alongside the sessions
+// LiveMap) so it appears live for everyone viewing the room. History on page
+// load comes from Supabase; no edit/delete — messages are permanent.
+
+type LiveChatMessage = {
+  id: string;
+  userId: string;
+  content: string;
+  timestamp: string;
+};
+
+async function handleChatCreate(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+  let body: { content?: unknown };
+  try {
+    body = (await readJsonBody(req)) as typeof body;
+  } catch (err) {
+    return sendJson(res, 400, {
+      error: err instanceof Error ? err.message : "bad request",
+    });
+  }
+  const content = typeof body.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    return sendJson(res, 400, { error: "content (non-empty string) required" });
+  }
+  if (content.length > 4000) {
+    return sendJson(res, 400, { error: "content too long (max 4000 chars)" });
+  }
+
+  const { data: message, error } = await supabase
+    .from("chat_messages")
+    .insert({ room_id: roomId, user_id: userId, content })
+    .select("id, user_id, content, created_at")
+    .single();
+  if (error || !message) {
+    return sendJson(res, 500, { error: error?.message ?? "insert failed" });
+  }
+
+  // Mirror into Liveblocks — alongside, never instead of, the durable write.
+  if (liveblocks) {
+    try {
+      await ensureLiveRoom(roomId);
+      await liveblocks.mutateStorage(liveRoomId(roomId), ({ root }) => {
+        let chat = root.get("chatMessages") as LiveList<LiveChatMessage>;
+        if (!chat) {
+          chat = new LiveList([]);
+          root.set("chatMessages", chat);
+        }
+        chat.push({
+          id: message.id,
+          userId: message.user_id,
+          content: message.content,
+          timestamp: message.created_at,
+        });
+      });
+    } catch (err) {
+      console.error(
+        `[tandem-server] liveblocks: failed to mirror chat message ` +
+          `${message.id}: ${err instanceof Error ? err.message : err}`
+      );
+    }
+  }
+
+  sendJson(res, 200, { message });
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 const UUID = "[0-9a-fA-F-]{36}";
 const MEMORY_COLLECTION = new RegExp(`^/rooms/(${UUID})/memory$`);
 const MEMORY_ENTRY = new RegExp(`^/rooms/(${UUID})/memory/(${UUID})$`);
+const CHAT_COLLECTION = new RegExp(`^/rooms/(${UUID})/chat$`);
 
 const httpServer = createServer((req, res) => {
   const route = async () => {
@@ -597,7 +674,8 @@ const httpServer = createServer((req, res) => {
 
     const collection = url.match(MEMORY_COLLECTION);
     const entry = url.match(MEMORY_ENTRY);
-    if (collection || entry) {
+    const chat = url.match(CHAT_COLLECTION);
+    if (collection || entry || chat) {
       const userId = await authUser(req, res);
       if (!userId) return;
       if (collection && req.method === "GET") {
@@ -608,6 +686,9 @@ const httpServer = createServer((req, res) => {
       }
       if (entry && req.method === "DELETE") {
         return handleMemoryDelete(res, entry[1], entry[2], userId);
+      }
+      if (chat && req.method === "POST") {
+        return handleChatCreate(req, res, chat[1], userId);
       }
     }
 

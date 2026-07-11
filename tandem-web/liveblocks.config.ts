@@ -22,6 +22,13 @@ declare global {
           events: LiveList<{ eventType: string; content: string; timestamp: string }>
         }>
       >
+      /** Team chat (Stage 9). Absent in rooms created before this stage. */
+      chatMessages?: LiveList<{
+        id: string
+        userId: string
+        content: string
+        timestamp: string
+      }>
     }
   }
 }

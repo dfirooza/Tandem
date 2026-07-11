@@ -73,6 +73,34 @@ export async function pinMemory(roomId: string, formData: FormData) {
   revalidatePath(`/rooms/${roomId}`)
 }
 
+// ─── Team chat (Stage 9) ─────────────────────────────────────────────────────
+// Same relay pattern: tandem-server does the durable insert + Liveblocks
+// mirror. No revalidate needed — the message arrives live via Liveblocks.
+
+export async function sendChatMessage(
+  roomId: string,
+  content: string
+): Promise<{ ok?: true; error?: string }> {
+  const token = await accessToken()
+  if (!token) return { error: 'not signed in' }
+
+  try {
+    const res = await fetch(`${TANDEM_SERVER()}/rooms/${roomId}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ content }),
+    })
+    const json = (await res.json().catch(() => ({}))) as { error?: string }
+    if (!res.ok) return { error: json.error ?? `tandem-server returned ${res.status}` }
+    return { ok: true }
+  } catch {
+    return { error: 'could not reach tandem-server — is it running?' }
+  }
+}
+
 export async function deleteMemory(roomId: string, entryId: string) {
   const token = await accessToken()
   if (!token) return
