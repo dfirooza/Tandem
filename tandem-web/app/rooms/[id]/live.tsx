@@ -16,25 +16,10 @@ import {
 // by tandem-server; this component only reads it. See liveblocks.config.ts
 // for the shared shape.
 
-const PANEL_STYLE: React.CSSProperties = {
-  border: '1px solid #ccc',
-  borderRadius: 4,
-  padding: '0.5rem',
-  marginBottom: '1rem',
-}
-
-const OUTPUT_STYLE: React.CSSProperties = {
-  background: '#111',
-  color: '#ddd',
-  fontFamily: 'monospace',
-  fontSize: '0.8rem',
-  whiteSpace: 'pre-wrap',
-  wordBreak: 'break-all',
-  height: '16rem',
-  overflowY: 'auto',
-  padding: '0.5rem',
-  margin: 0,
-}
+const PANEL_CLASS = 'card mb-3 p-3'
+const OUTPUT_CLASS =
+  'm-0 h-64 overflow-y-auto rounded-md border border-border bg-background p-3 ' +
+  'font-mono text-xs leading-relaxed whitespace-pre-wrap break-all text-foreground/90'
 
 function PresenceList() {
   const others = useOthers()
@@ -46,7 +31,8 @@ function PresenceList() {
   ]
 
   return (
-    <p style={{ color: '#555', fontSize: '0.875rem' }}>
+    <p className="mb-4 flex items-center gap-2 text-xs text-secondary">
+      <span className="status-dot status-dot--active" aria-hidden />
       Online now: {emails.length > 0 ? emails.join(', ') : '…'}
     </p>
   )
@@ -81,13 +67,9 @@ function Cursors() {
               ➤
             </span>
             <span
+              className="ml-0.5 rounded px-1 text-[0.7rem] font-medium text-white"
               style={{
                 background: CURSOR_COLORS[o.connectionId % CURSOR_COLORS.length],
-                color: '#fff',
-                fontSize: '0.7rem',
-                padding: '0 0.25rem',
-                borderRadius: 2,
-                marginLeft: 2,
               }}
             >
               {o.presence.email}
@@ -148,10 +130,7 @@ function EventSpans({
           key={i}
           onMouseEnter={() => setHovered(i)}
           onMouseLeave={() => setHovered((h) => (h === i ? null : h))}
-          style={{
-            position: 'relative',
-            background: hovered === i ? '#2a2a2a' : undefined,
-          }}
+          className={`relative ${hovered === i ? 'bg-accent/15' : ''}`}
         >
           {e.content}
           {hovered === i && (
@@ -159,15 +138,7 @@ function EventSpans({
               onClick={() => handleBranch(i + 1)}
               disabled={pending}
               title={`Branch a new session from event ${i + 1}`}
-              style={{
-                position: 'absolute',
-                top: '-0.2rem',
-                right: 0,
-                fontSize: '0.7rem',
-                padding: '0 0.3rem',
-                cursor: pending ? 'wait' : 'pointer',
-                zIndex: 5,
-              }}
+              className="absolute -top-1 right-0 z-[5] cursor-pointer rounded border border-accent/50 bg-surface px-1.5 py-0.5 font-sans text-[0.7rem] font-medium text-accent transition-colors hover:bg-accent hover:text-white disabled:cursor-wait disabled:opacity-60"
             >
               ⑂ {pending ? 'branching…' : 'branch from here'}
             </button>
@@ -194,26 +165,23 @@ function PanelHeader({
   parentEmail: string | null
 }) {
   return (
-    <p style={{ margin: '0 0 0.5rem' }}>
-      <strong>{email}</strong>{' '}
-      <span style={{ color: status === 'active' ? '#0a0' : '#888' }}>
-        ({status}
-        {statusSuffix})
-      </span>{' '}
-      <span style={{ color: '#aaa', fontSize: '0.75rem' }}>{sessionId}</span>
-      {parentSessionId && (
+    <p className="mb-3 mt-0">
+      <span className="flex flex-wrap items-center gap-2">
         <span
-          style={{
-            display: 'block',
-            color: '#96f',
-            fontSize: '0.8rem',
-            marginTop: '0.15rem',
-          }}
-        >
+          className={`status-dot ${status === 'active' ? 'status-dot--active' : 'status-dot--ended'}`}
+          aria-hidden
+        />
+        <strong className="text-[13px]">{email}</strong>
+        <span className={`text-[13px] ${status === 'active' ? 'text-accent' : 'text-muted'}`}>
+          ({status}
+          {statusSuffix})
+        </span>
+        <span className="font-mono text-xs text-muted">{sessionId}</span>
+      </span>
+      {parentSessionId && (
+        <span className="mt-1 block text-xs text-accent-hover">
           ⑂ branched from {parentEmail ?? parentSessionId.slice(0, 8)}{' '}
-          <span style={{ color: '#aaa', fontSize: '0.7rem' }}>
-            ({parentSessionId.slice(0, 8)})
-          </span>
+          <span className="font-mono text-muted">({parentSessionId.slice(0, 8)})</span>
         </span>
       )}
     </p>
@@ -238,14 +206,14 @@ function SessionPanel({
 }) {
   const outputRef = useRef<HTMLPreElement>(null)
 
-  // Auto-scroll to the newest output as events stream in.
+  // Auto-scroll smoothly to the newest output as events stream in.
   useEffect(() => {
     const el = outputRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [session.events.length])
 
   return (
-    <div style={PANEL_STYLE}>
+    <div className={PANEL_CLASS}>
       <PanelHeader
         email={email}
         status={session.status}
@@ -253,7 +221,7 @@ function SessionPanel({
         parentSessionId={session.parentSessionId}
         parentEmail={parentEmail}
       />
-      <pre ref={outputRef} style={OUTPUT_STYLE}>
+      <pre ref={outputRef} className={OUTPUT_CLASS}>
         <EventSpans sessionId={sessionId} events={session.events} />
       </pre>
     </div>
@@ -280,7 +248,8 @@ function SessionPanels({
   const sessions = useStorage((root) => root.sessions)
 
   // useStorage snapshots a LiveMap as a plain readonly object keyed by sessionId.
-  if (sessions === null) return <p style={{ color: '#555' }}>Connecting to live session feed…</p>
+  if (sessions === null)
+    return <p className="text-muted">Connecting to live session feed…</p>
   const entries = Object.entries(sessions)
 
   // Resolve a parent session's owner email for the lineage label. Owners come
@@ -306,15 +275,15 @@ function SessionPanels({
   const liveEntries = entries.filter(([id]) => !backfillIds.has(id))
 
   if (backfill.length === 0 && liveEntries.length === 0)
-    return <p style={{ color: '#555' }}>No sessions yet.</p>
+    return <p className="text-muted">No sessions yet.</p>
 
   return (
     <div>
       {backfill.length > 0 && (
         <div>
-          <h3 style={{ margin: '0.5rem 0' }}>History (from durable log)</h3>
+          <h3 className="eyebrow mb-3 mt-2">History (from durable log)</h3>
           {backfill.map((h) => (
-            <div key={h.sessionId} style={PANEL_STYLE}>
+            <div key={h.sessionId} className={PANEL_CLASS}>
               <PanelHeader
                 email={emailById[h.userId] ?? h.userId}
                 status={h.status}
@@ -323,7 +292,7 @@ function SessionPanels({
                 parentSessionId={h.parentSessionId}
                 parentEmail={parentEmailFor(h.parentSessionId)}
               />
-              <pre style={OUTPUT_STYLE}>
+              <pre className={OUTPUT_CLASS}>
                 <EventSpans sessionId={h.sessionId} events={h.events} />
               </pre>
             </div>
@@ -361,8 +330,8 @@ export default function LiveSessionSection({
   if (!publicKey) {
     return (
       <section>
-        <h2>Live sessions</h2>
-        <p style={{ color: '#a00' }}>
+        <h2 className="section-title">Live Sessions</h2>
+        <p className="error max-w-none">
           NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY is not set — live sessions are disabled.
         </p>
       </section>
@@ -371,7 +340,7 @@ export default function LiveSessionSection({
 
   return (
     <section>
-      <h2>Live sessions</h2>
+      <h2 className="section-title">Live Sessions</h2>
       <LiveblocksProvider publicApiKey={publicKey}>
         <RoomProvider
           id={`tandem-room-${roomId}`}

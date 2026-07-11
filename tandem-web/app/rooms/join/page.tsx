@@ -1,4 +1,3 @@
-import Link from 'next/link'
 import { joinRoom } from '@/app/rooms/actions'
 
 export default async function JoinRoomPage({
@@ -9,22 +8,24 @@ export default async function JoinRoomPage({
   const { error } = await searchParams
 
   return (
-    <main>
-      <Link href="/rooms">← Back to rooms</Link>
-      <h1>Join a room</h1>
+    <main className="w-full max-w-sm px-8 py-10">
+      <p className="eyebrow mb-2">Rooms</p>
+      <h1 className="mb-4">Join a room</h1>
       {error && <p className="error">{error}</p>}
-      <form action={joinRoom}>
+      <form action={joinRoom} className="space-y-4">
         <label>
           Invite code
           <input
+            className="input font-mono uppercase tracking-[0.15em]"
             type="text"
             name="invite_code"
             required
             placeholder="e.g. ABC12345"
-            style={{ textTransform: 'uppercase', letterSpacing: '0.1em' }}
           />
         </label>
-        <button type="submit">Join room</button>
+        <button type="submit" className="btn-primary">
+          Join room
+        </button>
       </form>
     </main>
   )

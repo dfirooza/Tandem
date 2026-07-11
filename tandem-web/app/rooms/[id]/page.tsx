@@ -1,5 +1,4 @@
 import { redirect, notFound } from 'next/navigation'
-import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 import { signOut } from '@/app/auth/actions'
 import { pinMemory, deleteMemory } from './actions'
@@ -88,97 +87,86 @@ export default async function RoomPage({
   const pinMemoryForRoom = pinMemory.bind(null, id)
 
   return (
-    <main>
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <Link href="/rooms">← Rooms</Link>
+    <main className="mx-auto w-full max-w-5xl px-8 py-6">
+      <header className="mb-6 flex items-center justify-between gap-4 border-b border-border pb-4">
+        <div className="flex items-baseline gap-3">
+          <h1 className="m-0">{room.name}</h1>
+          <span className="code" title="Share this invite code with teammates">
+            {room.invite_code}
+          </span>
+        </div>
         <form action={signOut}>
-          <button type="submit">Sign out</button>
+          <button type="submit" className="btn-ghost">
+            Sign out
+          </button>
         </form>
       </header>
 
-      <h1>{room.name}</h1>
-      <p>
-        Invite code:{' '}
-        <span className="code">{room.invite_code}</span>
-        <span style={{ color: '#555', fontSize: '0.875rem', marginLeft: '0.5rem' }}>
-          (share this with teammates)
-        </span>
-      </p>
-
-      <h2>Members ({members?.length ?? 0})</h2>
-      <ul style={{ listStyle: 'none', padding: 0 }}>
+      <h2 className="section-title mt-0">Members ({members?.length ?? 0})</h2>
+      <ul className="m-0 flex list-none flex-wrap gap-1.5 p-0">
         {members?.map((m) => (
-          <li key={m.user_id} style={{ padding: '0.25rem 0' }}>
+          <li
+            key={m.user_id}
+            className="rounded-md border border-border px-2 py-0.5 text-xs text-secondary"
+          >
             {emailById[m.user_id] ?? m.user_id}
-            {m.user_id === user.id && (
-              <span style={{ color: '#555', fontSize: '0.875rem', marginLeft: '0.4rem' }}>(you)</span>
-            )}
+            {m.user_id === user.id && <span className="ml-1 text-muted">(you)</span>}
           </li>
         ))}
       </ul>
 
       <section>
-        <h2>Project Memory</h2>
-        <form action={pinMemoryForRoom} style={{ marginBottom: '1rem' }}>
+        <h2 className="section-title">Project Memory</h2>
+        <form action={pinMemoryForRoom} className="card mb-4 max-w-2xl space-y-2 p-3">
           <textarea
             name="content"
             required
             placeholder="Pin a decision, convention, or piece of context…"
             rows={3}
-            style={{ display: 'block', width: '100%', maxWidth: '40rem' }}
+            className="input max-w-none resize-y"
           />
-          <input
-            name="tags"
-            placeholder="tags, comma, separated (optional)"
-            style={{ margin: '0.5rem 0.5rem 0 0', width: '20rem' }}
-          />
-          <button type="submit">Pin</button>
+          <div className="flex items-center gap-2">
+            <input
+              name="tags"
+              placeholder="tags, comma, separated (optional)"
+              className="input mt-0 w-80 font-mono text-sm"
+            />
+            <button type="submit" className="btn-primary">
+              Pin
+            </button>
+          </div>
         </form>
 
         {(memoryEntries ?? []).length === 0 ? (
-          <p style={{ color: '#555' }}>No memory pinned yet.</p>
+          <p className="text-muted">No memory pinned yet.</p>
         ) : (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
+          <ul className="m-0 list-none space-y-2 p-0">
             {(memoryEntries ?? []).map((entry) => (
-              <li
-                key={entry.id}
-                style={{
-                  border: '1px solid #ccc',
-                  borderRadius: 4,
-                  padding: '0.5rem',
-                  marginBottom: '0.5rem',
-                }}
-              >
-                <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{entry.content}</p>
-                <p style={{ margin: '0.25rem 0 0', color: '#555', fontSize: '0.8rem' }}>
+              <li key={entry.id} className="card max-w-2xl p-3">
+                <p className="m-0 whitespace-pre-wrap text-[13px]">{entry.content}</p>
+                <p className="mb-0 mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
                   {(entry.tags ?? []).length > 0 && (
-                    <span>
+                    <span className="flex gap-1">
                       {(entry.tags as string[]).map((t) => (
-                        <span
-                          key={t}
-                          className="code"
-                          style={{ marginRight: '0.3rem', fontSize: '0.75rem' }}
-                        >
+                        <span key={t} className="code px-1.5 text-xs tracking-normal text-muted">
                           {t}
                         </span>
                       ))}
-                      {' · '}
                     </span>
                   )}
-                  pinned by {emailById[entry.pinned_by] ?? entry.pinned_by} ·{' '}
-                  {new Date(entry.created_at).toLocaleString()}
+                  <span>
+                    pinned by {emailById[entry.pinned_by] ?? entry.pinned_by} ·{' '}
+                    {new Date(entry.created_at).toLocaleString()}
+                  </span>
                   {entry.pinned_by === user.id && (
-                    <>
-                      {' · '}
-                      <button
-                        formAction={deleteMemory.bind(null, id, entry.id)}
-                        form={`delete-${entry.id}`}
-                        type="submit"
-                        style={{ fontSize: '0.75rem' }}
-                      >
-                        Delete
-                      </button>
-                    </>
+                    <button
+                      formAction={deleteMemory.bind(null, id, entry.id)}
+                      form={`delete-${entry.id}`}
+                      type="submit"
+                      className="cursor-pointer rounded border border-transparent bg-transparent px-1.5 py-0.5 text-xs text-muted transition-colors hover:border-danger/40 hover:text-danger"
+                    >
+                      Delete
+                    </button>
                   )}
                 </p>
                 {entry.pinned_by === user.id && <form id={`delete-${entry.id}`} />}

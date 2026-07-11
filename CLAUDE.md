@@ -29,27 +29,16 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 6 complete and verified end-to-end. Room members can pin memory 
-entries via a new Project Memory panel; entries are stored durably in 
-Supabase with RLS (any member can create, only the pinner can delete). 
-tandem-cli fetches a room's pinned memory at startup and writes it to 
-CLAUDE.md in a fresh directory (or TANDEM_MEMORY.md if CLAUDE.md already 
-exists, never overwriting user files). Confirmed end-to-end: pinned a 
-real memory entry, verified cross-account visibility and delete 
-permissions, and confirmed a real Claude Code session in a fresh 
-directory correctly cited the pinned memory content unprompted when 
-asked "what do you know about this project?" — 13/13 memory e2e tests, 
-all prior stage regressions still green (7/7, 5/5, 11/11).
-
-ALL SIX ORIGINAL STAGES COMPLETE. Tandem now has: live multiplayer 
-session visibility, presence and cursors, reconnect/resume with 
-backfill, cross-owner branching, and persistent project memory injected 
-into new sessions. 
-
-Known follow-ups not yet built: visual design/styling (everything is 
-functional but unstyled by design through all 6 stages), team chat 
-(not in original scope), live continuation of a branched session, 
-automatic/AI-driven memory extraction (currently manual pinning only).
+Stage 8 complete: tandem-web restructured into a persistent sidebar app 
+shell (Tandem wordmark + rooms list on the left, main content area on 
+the right) replacing the single-column page layout. Restyled to a 
+sharper monochrome-plus-one-accent direction: true near-black 
+background, hairline borders, 6px sharp corners, blue (#3291FF range) 
+reserved for active status, primary actions, links, and accents only. 
+All Stage 0-6 functionality confirmed working within the new shell.
+Next: team chat, then turn-based session takeover, then live 
+auto-summarized shared context (the harder remaining items from the 
+user's Jul 10 feature list).
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

@@ -1,8 +1,99 @@
-*, *::before, *::after { box-sizing: border-box; }
-body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 2rem; }
-a { color: inherit; }
-input { display: block; margin-top: 0.25rem; padding: 0.4rem 0.6rem; font-size: 1rem; width: 100%; max-width: 24rem; }
-button { margin-top: 0.75rem; padding: 0.4rem 1rem; font-size: 1rem; cursor: pointer; }
-.error { color: #c00; margin: 0.5rem 0; }
-.code { font-family: monospace; font-size: 1.25rem; background: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 4px; }
-nav { margin: 0.75rem 0; display: flex; gap: 1rem; }
+@import 'tailwindcss';
+
+/* ─── Design tokens ─────────────────────────────────────────────────────────
+   Monochrome + one accent. True near-black, hairline borders doing the
+   separation (no elevated surface shifts), blue reserved for: active
+   status, primary actions, links, invite codes, active sidebar item, and
+   tag accents. No green anywhere — blue is the "alive" signal. */
+@theme {
+  --color-background: #000000;
+  --color-sidebar: #0a0a0a;
+  --color-surface: #0a0a0a;
+  --color-surface-hover: #161616;
+  --color-foreground: #ffffff;
+  --color-secondary: #a3a3a3;
+  --color-muted: #666666;
+  --color-accent: #3291ff;
+  --color-accent-hover: #5caeff;
+  --color-warning: #f59e0b;
+  --color-danger: #f87171;
+  --color-border: #262626;
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    @apply bg-background font-sans text-[13.5px] text-foreground antialiased;
+  }
+  a {
+    @apply text-accent transition-colors hover:text-accent-hover;
+  }
+  h1 {
+    @apply text-lg font-semibold tracking-tight;
+  }
+  label {
+    @apply block text-xs text-secondary;
+  }
+  ::placeholder {
+    color: #4d4d4d;
+  }
+}
+
+@layer components {
+  .input {
+    @apply mt-1 block w-full max-w-sm rounded-md border border-border bg-surface px-3 py-1.5 text-[13px] text-foreground outline-none transition-colors focus:border-accent focus:ring-1 focus:ring-accent/40;
+  }
+  /* Shared button base is inlined into each variant: `@apply` only accepts
+     real utilities, not other component classes (v4 would need @utility). */
+  .btn-primary {
+    @apply inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors bg-accent text-white hover:bg-accent-hover;
+  }
+  .btn-ghost {
+    @apply inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-border bg-transparent px-3 py-1.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover hover:text-foreground;
+  }
+  /* Hairline borders separate panels; background stays near-black. */
+  .card {
+    @apply rounded-md border border-border bg-background;
+  }
+  .code {
+    @apply rounded-[4px] border border-border bg-surface px-1.5 py-0.5 font-mono text-xs tracking-wider text-accent;
+  }
+  .error {
+    @apply my-2 max-w-sm rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger;
+  }
+  /* Uppercase letter-spaced eyebrow instead of large bold headings. */
+  .section-title {
+    @apply mb-3 mt-8 border-b border-border pb-2 text-[11px] font-medium uppercase tracking-[0.14em] text-muted;
+  }
+  .eyebrow {
+    @apply text-[11px] font-medium uppercase tracking-[0.14em] text-muted;
+  }
+  .status-dot {
+    @apply inline-block h-2 w-2 shrink-0 rounded-full;
+  }
+  .status-dot--active {
+    background: var(--color-accent);
+    box-shadow: 0 0 6px rgb(50 145 255 / 0.7);
+    animation: pulse-glow 2.4s ease-in-out infinite;
+  }
+  .status-dot--ended {
+    background: #525252;
+  }
+}
+
+/* Subtle glow for active/online status indicators (blue, not green). */
+@keyframes pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(50 145 255 / 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgb(50 145 255 / 0);
+  }
+}
