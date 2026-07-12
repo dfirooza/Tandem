@@ -432,6 +432,8 @@ export interface HistorySession {
   userId: string
   status: string
   parentSessionId: string | null
+  lastSummary: string | null
+  lastSummaryAt: string | null
   events: { content: string }[]
 }
 
@@ -453,32 +455,25 @@ function RelativeTime({ since }: { since: string }) {
 }
 
 /**
- * Compact "who's doing what" row for an active session (Stage 11). Shows the
- * live auto-summary; clicking expands into the full session view (xterm +
- * branch/control), clicking again collapses.
+ * Compact "who's doing what" row (Stage 11/12): summary + owner + relative
+ * time; clicking expands into the full session view, clicking again
+ * collapses. Used for active sessions AND history entries.
  */
 function CompactSessionRow({
-  sessionId,
-  session,
   email,
+  summary,
+  active,
+  timeSince,
   expanded,
   onToggle,
 }: {
-  sessionId: string
-  session: {
-    parentSessionId?: string | null
-    lastSummary?: string | null
-    lastSummaryAt?: string | null
-  }
   email: string
+  summary: string
+  active: boolean
+  timeSince?: string | null
   expanded: boolean
   onToggle: () => void
 }) {
-  const isBranch = !!session.parentSessionId
-  const summary = isBranch
-    ? 'Static branch copy — no live process attached'
-    : (session.lastSummary ?? 'Just started…')
-
   return (
     <button
       onClick={onToggle}
@@ -487,16 +482,63 @@ function CompactSessionRow({
       }`}
     >
       <span
-        className={`status-dot ${isBranch ? 'status-dot--ended' : 'status-dot--active'}`}
+        className={`status-dot ${active ? 'status-dot--active' : 'status-dot--ended'}`}
         aria-hidden
       />
       <span className="shrink-0 text-[13px] font-medium text-foreground">{email}</span>
       <span className="min-w-0 flex-1 truncate text-[13px] text-secondary">
         {summary}
       </span>
-      {session.lastSummaryAt && !isBranch && (
+      {timeSince && (
         <span className="shrink-0 text-[11px] text-muted">
-          <RelativeTime since={session.lastSummaryAt} />
+          <RelativeTime since={timeSince} />
+        </span>
+      )}
+      <span className="shrink-0 text-[11px] text-muted">{expanded ? '▾' : '▸'}</span>
+    </button>
+  )
+}
+
+/**
+ * History row: who, when, what was accomplished. Only rendered for entries
+ * that HAVE a real summary (everything else is filtered out upstream);
+ * clicking expands into the full raw content, clicking again collapses.
+ */
+function HistoryRow({
+  email,
+  summary,
+  isBranch,
+  at,
+  expanded,
+  onToggle,
+}: {
+  email: string
+  summary: string
+  isBranch: boolean
+  at: string | null
+  expanded: boolean
+  onToggle: () => void
+}) {
+  return (
+    <button
+      onClick={onToggle}
+      className={`flex w-full cursor-pointer items-center gap-2.5 bg-transparent px-3 py-2 text-left transition-colors hover:bg-surface-hover ${
+        expanded ? 'bg-surface-hover' : ''
+      }`}
+    >
+      <span className="status-dot status-dot--ended" aria-hidden />
+      <span className="shrink-0 text-[13px] font-medium text-foreground">{email}</span>
+      {isBranch && (
+        <span className="shrink-0 rounded-[4px] border border-border px-1 text-[10px] uppercase tracking-wider text-muted">
+          branch
+        </span>
+      )}
+      <span className="min-w-0 flex-1 truncate text-[13px] text-secondary">
+        {summary}
+      </span>
+      {at && (
+        <span className="shrink-0 text-[11px] text-muted">
+          <RelativeTime since={at} />
         </span>
       )}
       <span className="shrink-0 text-[11px] text-muted">{expanded ? '▾' : '▸'}</span>
@@ -541,26 +583,63 @@ function SessionPanels({
     return ownerId ? (emailById[ownerId] ?? ownerId) : null
   }
 
-  // Late-joiner backfill: sessions whose durable history exists in Supabase
-  // but whose events are missing from Liveblocks storage (cleared/reset).
-  // Rendered as static panels above the live section.
-  const liveIdsWithEvents = new Set(
-    entries.filter(([, s]) => s.events.length > 0).map(([id]) => id)
-  )
-  const backfill = historySessions.filter(
-    (h) => !liveIdsWithEvents.has(h.sessionId) && h.events.length > 0
-  )
-  const backfillIds = new Set(backfill.map((h) => h.sessionId))
-  // Hide a live panel only when it's empty AND replaced by a history panel.
-  const liveEntries = entries.filter(([id]) => !backfillIds.has(id))
+  // All live-map entries render somewhere; durable-only history (storage
+  // cleared/reset, or pre-Liveblocks sessions) is folded into historyItems
+  // below via historySessions — summaries only, never raw events.
+  const liveEntries = entries
 
-  // Compact treatment (Stage 11): active sessions render as one summary row
-  // each, expanding to the full panel on click. Ended sessions keep their
-  // existing full-panel form.
-  const activeEntries = liveEntries.filter(([, s]) => s.status === 'active')
-  const endedEntries = liveEntries.filter(([, s]) => s.status !== 'active')
+  // Compact treatment (Stage 11/12): REAL live sessions (active, non-branch)
+  // get the active list. History is strictly who/when/what: only entries
+  // with a real summary appear, as flat single-line rows — no raw content,
+  // no placeholders. Unsummarized ended sessions simply don't show (the
+  // durable session_events record is untouched, just not surfaced here).
+  const activeEntries = liveEntries.filter(
+    ([, s]) => s.status === 'active' && !s.parentSessionId
+  )
+  const staticEntries = liveEntries.filter(
+    ([, s]) => s.status !== 'active' || s.parentSessionId
+  )
 
-  if (backfill.length === 0 && liveEntries.length === 0)
+  const liveMapIds = new Set(entries.map(([id]) => id))
+  type LiveSessionSnapshot = (typeof staticEntries)[number][1]
+  const historyItems: {
+    id: string
+    email: string
+    summary: string
+    isBranch: boolean
+    at: string | null
+    /** Expansion payload: full live-map session or durable-log record. */
+    source:
+      | { kind: 'live'; session: LiveSessionSnapshot }
+      | { kind: 'durable'; record: HistorySession }
+  }[] = []
+  for (const [id, s] of staticEntries) {
+    if (!s.lastSummary) continue
+    historyItems.push({
+      id,
+      email: emailById[s.userId] ?? s.userId,
+      summary: s.lastSummary,
+      isBranch: !!s.parentSessionId,
+      at: s.lastSummaryAt ?? null,
+      source: { kind: 'live', session: s },
+    })
+  }
+  for (const h of historySessions) {
+    if (liveMapIds.has(h.sessionId)) continue // already covered above
+    if (!h.lastSummary) continue
+    if (h.status === 'active' && !h.parentSessionId) continue // not history
+    historyItems.push({
+      id: h.sessionId,
+      email: emailById[h.userId] ?? h.userId,
+      summary: h.lastSummary,
+      isBranch: !!h.parentSessionId,
+      at: h.lastSummaryAt,
+      source: { kind: 'durable', record: h },
+    })
+  }
+  historyItems.sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''))
+
+  if (activeEntries.length === 0 && historyItems.length === 0)
     return <p className="text-muted">No sessions yet.</p>
 
   return (
@@ -570,9 +649,10 @@ function SessionPanels({
           {activeEntries.map(([sessionId, session]) => (
             <div key={sessionId}>
               <CompactSessionRow
-                sessionId={sessionId}
-                session={session}
                 email={emailById[session.userId] ?? session.userId}
+                summary={session.lastSummary ?? 'Just started…'}
+                active
+                timeSince={session.lastSummaryAt}
                 expanded={expandedIds.has(sessionId)}
                 onToggle={() => toggleExpanded(sessionId)}
               />
@@ -592,37 +672,55 @@ function SessionPanels({
           ))}
         </div>
       )}
-      {backfill.length > 0 && (
-        <div>
-          <h3 className="eyebrow mb-3 mt-2">History (from durable log)</h3>
-          {backfill.map((h) => (
-            <div key={h.sessionId} className={PANEL_CLASS}>
-              <PanelHeader
-                email={emailById[h.userId] ?? h.userId}
-                status={h.status}
-                statusSuffix=" — history"
-                sessionId={h.sessionId}
-                parentSessionId={h.parentSessionId}
-                parentEmail={parentEmailFor(h.parentSessionId)}
-              />
-              <pre className={OUTPUT_CLASS}>
-                <EventSpans sessionId={h.sessionId} events={h.events} />
-              </pre>
-            </div>
-          ))}
-        </div>
+
+      {historyItems.length > 0 && (
+        <>
+          <h3 className="eyebrow mb-3 mt-2">History</h3>
+          <div className="card mb-4 divide-y divide-border overflow-hidden">
+            {historyItems.map((item) => (
+              <div key={item.id}>
+                <HistoryRow
+                  email={item.email}
+                  summary={item.summary}
+                  isBranch={item.isBranch}
+                  at={item.at}
+                  expanded={expandedIds.has(item.id)}
+                  onToggle={() => toggleExpanded(item.id)}
+                />
+                {expandedIds.has(item.id) &&
+                  (item.source.kind === 'live' ? (
+                    <div className="border-t border-border p-3">
+                      <SessionPanel
+                        sessionId={item.id}
+                        session={item.source.session}
+                        email={item.email}
+                        parentEmail={parentEmailFor(item.source.session.parentSessionId)}
+                        selfId={selfId}
+                        emailById={emailById}
+                      />
+                    </div>
+                  ) : (
+                    <div className="border-t border-border p-3">
+                      <div className={PANEL_CLASS}>
+                        <PanelHeader
+                          email={item.email}
+                          status={item.source.record.status}
+                          statusSuffix=" — history"
+                          sessionId={item.id}
+                          parentSessionId={item.source.record.parentSessionId}
+                          parentEmail={parentEmailFor(item.source.record.parentSessionId)}
+                        />
+                        <pre className={OUTPUT_CLASS}>
+                          <EventSpans sessionId={item.id} events={item.source.record.events} />
+                        </pre>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            ))}
+          </div>
+        </>
       )}
-      {endedEntries.map(([sessionId, session]) => (
-        <SessionPanel
-          key={sessionId}
-          sessionId={sessionId}
-          session={session}
-          email={emailById[session.userId] ?? session.userId}
-          parentEmail={parentEmailFor(session.parentSessionId)}
-          selfId={selfId}
-          emailById={emailById}
-        />
-      ))}
     </div>
   )
 }

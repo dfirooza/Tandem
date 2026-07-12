@@ -29,33 +29,19 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 11 complete: auto-summarized shared context. Active sessions with 
-new activity get summarized by Claude Haiku every 45s (one global 
-interval + per-session state map, no per-session timers to leak — 
-entry absence is the stop signal). Summaries are concrete and accurate 
-(verified: correctly captured specific technical detail from real 
-session content, not generic filler). Room view defaults to a compact 
-"who's doing what" list (pulsing status, live summary, relative time) 
-with click-to-expand into the full session panel. tandem-cli now injects 
-a "Currently active in this room" section into generated CLAUDE.md 
-alongside pinned memory — confirmed end-to-end: a fresh Claude Code 
-session in an empty directory correctly answered "what is my team 
-currently working on?" by citing a teammate's real, live session 
-summary, with zero manual input. Idle sessions are skipped (no wasted 
-API calls), and summarization timers verified to stop within one 
-interval of session end. Debug call counter at GET /debug/summaries.
-
-ALL STAGES FROM THE ORIGINAL 6-STAGE PLAN PLUS FOLLOW-ON STAGES 7-11 
-ARE COMPLETE. Tandem now has: live multiplayer session visibility with 
-presence and cursors, reconnect/resume with backfill, cross-owner 
-branching, persistent pinned memory, a full sidebar-shell UI in a 
-monochrome+blue design direction, team chat, security-verified 
-turn-based remote session control via xterm.js, and live AI-generated 
-shared context that new sessions automatically receive.
-
-Known follow-ups, not yet built: live continuation of a branched session, 
-browser terminal size sync to PTY dimensions (cosmetic), any real users 
-beyond the founder testing solo.
+Stage 12 complete: room/endpoint visibility audit (found and fixed a 
+real gap — CLI WebSocket auth wasn't checking room membership, only 
+valid auth, meaning any signed-in user who knew a room UUID could join 
+a session in it; now enforced and proven closed across all 
+surfaces: rooms, sessions, memory, chat, activity, branch, control, 
+and both WS auth paths — 21/21 e2e). History simplified per user 
+feedback: only sessions/branches with a real summary appear, compact 
+single-line rows (owner, time, summary, branch badge if applicable), 
+with click-to-expand into the full raw content (expand was removed, 
+then restored per follow-up feedback) — Live Sessions unaffected.
+Next: in-terminal passive activity visibility, so users see teammate 
+updates without switching to the browser (highest-priority remaining 
+item from user feedback).
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

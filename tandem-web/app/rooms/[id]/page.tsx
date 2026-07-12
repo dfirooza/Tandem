@@ -47,7 +47,7 @@ export default async function RoomPage({
   // "branch from here" target.
   const { data: dbSessions } = await supabase
     .from('sessions')
-    .select('id, user_id, status, parent_session_id')
+    .select('id, user_id, status, parent_session_id, last_summary, last_summary_at')
     .eq('room_id', id)
     .order('started_at', { ascending: true })
 
@@ -69,6 +69,8 @@ export default async function RoomPage({
     userId: s.user_id,
     status: s.status,
     parentSessionId: s.parent_session_id as string | null,
+    lastSummary: (s.last_summary as string | null) ?? null,
+    lastSummaryAt: (s.last_summary_at as string | null) ?? null,
     events: eventsBySession[s.id] ?? [],
   }))
 

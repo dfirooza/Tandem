@@ -207,6 +207,13 @@ async function handleAuth(
     ws.close(CLOSE_AUTH_FAILED, "token does not match userId");
     return null;
   }
+  // Stage 12 audit fix: sessions may only be opened INTO rooms the user is a
+  // member of. Without this, any authenticated user who knew a room's UUID
+  // could plant a session (and stream content) into it.
+  if (!(await isRoomMember(msg.roomId, msg.userId))) {
+    ws.close(CLOSE_AUTH_FAILED, "not a member of this room");
+    return null;
+  }
 
   const { data: session, error: sessionError } = await supabase
     .from("sessions")
@@ -480,7 +487,10 @@ function summaryStopSession(sessionId: string): void {
   summaryStateBySession.delete(sessionId);
 }
 
-async function summarizeSession(sessionId: string, s: SummaryState): Promise<void> {
+/** The single Haiku summarization call — shared by the Stage 11 interval
+    summarizer and the Stage 12 one-time branch summary. Returns null when
+    the model produced nothing usable. */
+async function generateSummary(transcript: string): Promise<string | null> {
   const response = await anthropic!.messages.create({
     model: SUMMARY_MODEL,
     max_tokens: 60,
@@ -496,18 +506,23 @@ async function summarizeSession(sessionId: string, s: SummaryState): Promise<voi
         role: "user",
         content:
           "Recent terminal output from the coding session (ANSI stripped):\n\n" +
-          s.buffer,
+          transcript.slice(-SUMMARY_BUFFER_MAX_CHARS),
       },
     ],
   });
+  summaryCallCount++;
   const summary = response.content
     .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join(" ")
     .trim();
+  return summary || null;
+}
+
+async function summarizeSession(sessionId: string, s: SummaryState): Promise<void> {
+  const summary = await generateSummary(s.buffer);
   if (!summary) return;
 
-  summaryCallCount++;
   console.log(
     `[tandem-server] summary #${summaryCallCount} for session ${sessionId}: ` +
       `"${summary}"`
@@ -766,6 +781,43 @@ async function handleBranch(
       `at event ${events?.length ?? 0} (by user ${userId})`
   );
   sendJson(res, 200, { sessionId: branch.id });
+
+  // Stage 12: one-time summary for the static branch copy (async backfill —
+  // the response above is already sent). Branches never enter the Stage 11
+  // interval summarizer (no CLI connection), so this is their only summary.
+  // Skipped when there is nothing to summarize: no content, no API call.
+  const transcript = (events ?? []).map((e) => e.content ?? "").join("");
+  if (anthropic && transcript.trim().length > 0) {
+    void (async () => {
+      try {
+        const summary = await generateSummary(transcript);
+        if (!summary) return;
+        console.log(
+          `[tandem-server] summary #${summaryCallCount} for branch ` +
+            `${branch.id}: "${summary}"`
+        );
+        const at = new Date().toISOString();
+        await supabase
+          .from("sessions")
+          .update({ last_summary: summary, last_summary_at: at })
+          .eq("id", branch.id);
+        if (liveblocks) {
+          await liveblocks.mutateStorage(liveRoomId(source.room_id), ({ root }) => {
+            const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+            const entry = sessions?.get(branch.id);
+            if (!entry) return;
+            entry.set("lastSummary", summary);
+            entry.set("lastSummaryAt", at);
+          });
+        }
+      } catch (err) {
+        console.error(
+          `[tandem-server] branch summary failed for ${branch.id}: ` +
+            `${err instanceof Error ? err.message : err}`
+        );
+      }
+    })();
+  }
 }
 
 // ─── Memory endpoints (Stage 6) ──────────────────────────────────────────────
