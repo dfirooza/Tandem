@@ -29,24 +29,33 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 10 complete: turn-based remote session control. Any room member 
-can request control of a teammate's active session; the owner (if 
-present in the room) approves or denies via a 30s-timeout prompt. Once 
-granted, the controller gets real keystroke-level control through an 
-embedded xterm.js terminal, with input routed browser -> tandem-server 
--> the owner's tandem-cli -> their local PTY. Control state lives only 
-in server memory (never Liveblocks, never trusted from client claims) 
-and is re-verified on every single input message. The owner's local 
-terminal stdin always works regardless of control state; the web panel's 
-input path is exclusively locked to whoever holds control. Auto-releases 
-on disconnect, CLI drop, timeout, deny, or explicit revoke. 24/24 e2e 
-tests including 4 dedicated security checks, all confirmed by the user 
-directly with two real accounts (request, approve, remote typing 
-reaching the real terminal, and the owner's web-panel input correctly 
-blocked while someone else controls). Known limitation: browser terminal 
-size is not synced to the owner's PTY dimensions (cosmetic, follow-up).
-Next: auto-summarized shared context + compact UI redesign — the last 
-remaining item from the user's Jul 10 feature list.
+Stage 11 complete: auto-summarized shared context. Active sessions with 
+new activity get summarized by Claude Haiku every 45s (one global 
+interval + per-session state map, no per-session timers to leak — 
+entry absence is the stop signal). Summaries are concrete and accurate 
+(verified: correctly captured specific technical detail from real 
+session content, not generic filler). Room view defaults to a compact 
+"who's doing what" list (pulsing status, live summary, relative time) 
+with click-to-expand into the full session panel. tandem-cli now injects 
+a "Currently active in this room" section into generated CLAUDE.md 
+alongside pinned memory — confirmed end-to-end: a fresh Claude Code 
+session in an empty directory correctly answered "what is my team 
+currently working on?" by citing a teammate's real, live session 
+summary, with zero manual input. Idle sessions are skipped (no wasted 
+API calls), and summarization timers verified to stop within one 
+interval of session end. Debug call counter at GET /debug/summaries.
+
+ALL STAGES FROM THE ORIGINAL 6-STAGE PLAN PLUS FOLLOW-ON STAGES 7-11 
+ARE COMPLETE. Tandem now has: live multiplayer session visibility with 
+presence and cursors, reconnect/resume with backfill, cross-owner 
+branching, persistent pinned memory, a full sidebar-shell UI in a 
+monochrome+blue design direction, team chat, security-verified 
+turn-based remote session control via xterm.js, and live AI-generated 
+shared context that new sessions automatically receive.
+
+Known follow-ups, not yet built: live continuation of a branched session, 
+browser terminal size sync to PTY dimensions (cosmetic), any real users 
+beyond the founder testing solo.
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

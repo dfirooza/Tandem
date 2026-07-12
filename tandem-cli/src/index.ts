@@ -247,42 +247,91 @@ interface MemoryEntry {
   tags?: string[];
 }
 
+interface ActivityEntry {
+  email: string;
+  lastSummary?: string | null;
+}
+
 async function fetchAndWriteMemory(): Promise<void> {
   // The WS URL doubles as the HTTP base (ws->http, wss->https).
   const httpUrl = serverUrl!.replace(/^ws/i, "http");
-  let entries: MemoryEntry[];
+  const headers = { Authorization: `Bearer ${userToken}` };
+
+  let entries: MemoryEntry[] = [];
+  let memoryFailed = false;
   try {
     const res = await fetch(`${httpUrl}/rooms/${roomId}/memory`, {
-      headers: { Authorization: `Bearer ${userToken}` },
+      headers,
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`server returned ${res.status}`);
     const json = (await res.json()) as { entries?: MemoryEntry[] };
     entries = Array.isArray(json.entries) ? json.entries : [];
   } catch (err) {
+    memoryFailed = true;
     process.stderr.write(
       `[tandem] warning: could not fetch room memory ` +
-        `(${err instanceof Error ? err.message : err}). ` +
-        `Launching without it.\n`
+        `(${err instanceof Error ? err.message : err}).\n`
     );
+  }
+
+  // Live teammate context (Stage 11): what active sessions in this room are
+  // currently working on, from the server's auto-summaries.
+  let activity: ActivityEntry[] = [];
+  try {
+    const res = await fetch(`${httpUrl}/rooms/${roomId}/activity`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const json = (await res.json()) as { sessions?: ActivityEntry[] };
+    activity = Array.isArray(json.sessions) ? json.sessions : [];
+  } catch (err) {
+    process.stderr.write(
+      `[tandem] warning: could not fetch room activity ` +
+        `(${err instanceof Error ? err.message : err}).\n`
+    );
+  }
+
+  if (entries.length === 0 && activity.length === 0) {
+    if (memoryFailed) {
+      process.stderr.write(`[tandem] launching without room context.\n`);
+    }
     return;
   }
-  if (entries.length === 0) return;
 
-  const body = [
+  const lines = [
     "# Tandem Room Memory",
     "",
-    `Auto-generated from this Tandem room's pinned memory ` +
+    `Auto-generated from this Tandem room ` +
       `(${new Date().toISOString()}). Treat these as project context and ` +
       `conventions pinned by the team.`,
-    "",
-    ...entries.map((e) => {
-      const tags = e.tags?.length ? ` _(tags: ${e.tags.join(", ")})_` : "";
-      // Indent continuation lines so multi-line entries stay one bullet.
-      return `- ${String(e.content).replace(/\r?\n/g, "\n  ")}${tags}`;
-    }),
-    "",
-  ].join("\n");
+  ];
+  if (entries.length > 0) {
+    lines.push(
+      "",
+      ...entries.map((e) => {
+        const tags = e.tags?.length ? ` _(tags: ${e.tags.join(", ")})_` : "";
+        // Indent continuation lines so multi-line entries stay one bullet.
+        return `- ${String(e.content).replace(/\r?\n/g, "\n  ")}${tags}`;
+      })
+    );
+  }
+  if (activity.length > 0) {
+    lines.push(
+      "",
+      "## Currently active in this room",
+      "",
+      "Live AI coding sessions running right now (auto-summarized; may " +
+        "include this session):",
+      "",
+      ...activity.map(
+        (a) => `- ${a.email}: ${a.lastSummary ?? "(session just started)"}`
+      )
+    );
+  }
+  lines.push("");
+  const body = lines.join("\n");
 
   const claudeMdExists = fs.existsSync(path.join(process.cwd(), "CLAUDE.md"));
   const target = claudeMdExists ? "TANDEM_MEMORY.md" : "CLAUDE.md";
@@ -295,15 +344,17 @@ async function fetchAndWriteMemory(): Promise<void> {
     );
     return;
   }
+  const summaryOfContents =
+    `${entries.length} pinned entries, ${activity.length} active sessions`;
   if (claudeMdExists) {
     process.stderr.write(
       `[tandem] a CLAUDE.md already exists here, so room memory was written ` +
-        `to TANDEM_MEMORY.md instead (${entries.length} entries). Reference ` +
+        `to TANDEM_MEMORY.md instead (${summaryOfContents}). Reference ` +
         `it manually — Tandem never overwrites your project instructions.\n`
     );
   } else {
     process.stderr.write(
-      `[tandem] wrote ${entries.length} pinned memory entries to CLAUDE.md\n`
+      `[tandem] wrote room context to CLAUDE.md (${summaryOfContents})\n`
     );
   }
 }

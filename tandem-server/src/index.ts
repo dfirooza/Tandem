@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { createServer } from "node:http";
+import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import {
   Liveblocks,
@@ -77,6 +78,9 @@ type LiveSession = LiveObject<{
   controllerId?: string | null;
   pendingRequesterId?: string | null;
   pendingRequestedAt?: string | null;
+  /** Auto-summarized "what is this session working on" (Stage 11). */
+  lastSummary?: string | null;
+  lastSummaryAt?: string | null;
   events: LiveList<{
     eventType: string;
     content: string;
@@ -273,6 +277,8 @@ async function handleEvent(state: ConnectionState, msg: EventMessage) {
     ...(typeof msg.raw === "string" ? { raw: msg.raw } : {}),
     timestamp: msg.timestamp,
   });
+  // Feed the summarizer (Stage 11) — marks the session dirty for the next tick.
+  summaryTrackEvent(state, msg.content);
 }
 
 async function endSession(state: ConnectionState) {
@@ -416,6 +422,151 @@ async function releaseControl(sessionId: string, reason: string): Promise<void> 
     pendingRequesterId: null,
     pendingRequestedAt: null,
   });
+}
+
+// ─── Session summarization (Stage 11) ────────────────────────────────────────
+// Every SUMMARY_INTERVAL_MS, each ACTIVE session that received new events
+// since its last summary gets summarized by Claude Haiku into one short
+// status line — stored durably on sessions.last_summary and mirrored to
+// Liveblocks for the live UI. Idle sessions are skipped (no API call).
+//
+// ⚠️ Timer lifecycle discipline (cost-critical): there are no per-session
+// timers to leak — ONE global interval iterates summaryStateBySession, and a
+// session's entry is deleted the moment its CLI connection closes (same
+// hook that releases control and marks the session ended). No entry, no API
+// call — verified by test/e2e-stage11-summary.mjs.
+
+const SUMMARY_INTERVAL_MS = Number(process.env.SUMMARY_INTERVAL_MS ?? 45_000);
+/** Keep roughly the last ~3000 tokens of transcript for the prompt. */
+const SUMMARY_BUFFER_MAX_CHARS = 12_000;
+const SUMMARY_MODEL = "claude-haiku-4-5";
+
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+if (!anthropic) {
+  console.warn(
+    "[tandem-server] ANTHROPIC_API_KEY not set — session summarization is " +
+      "disabled. Everything else works normally."
+  );
+}
+
+interface SummaryState {
+  roomId: string;
+  /** Rolling tail of recent stripped output. */
+  buffer: string;
+  /** True when events arrived since the last summary — the API-call gate. */
+  dirty: boolean;
+}
+
+const summaryStateBySession = new Map<string, SummaryState>();
+
+/** In-memory API call counter, exposed via GET /debug/summaries and logged
+    per call, to make call volume easy to sanity-check. */
+let summaryCallCount = 0;
+
+function summaryTrackEvent(state: ConnectionState, content: string): void {
+  if (!anthropic) return;
+  let s = summaryStateBySession.get(state.sessionId);
+  if (!s) {
+    s = { roomId: state.roomId, buffer: "", dirty: false };
+    summaryStateBySession.set(state.sessionId, s);
+  }
+  s.buffer = (s.buffer + content).slice(-SUMMARY_BUFFER_MAX_CHARS);
+  s.dirty = true;
+}
+
+/** Called the instant a session's CLI connection closes — stops all future
+    summarization for it. */
+function summaryStopSession(sessionId: string): void {
+  summaryStateBySession.delete(sessionId);
+}
+
+async function summarizeSession(sessionId: string, s: SummaryState): Promise<void> {
+  const response = await anthropic!.messages.create({
+    model: SUMMARY_MODEL,
+    max_tokens: 60,
+    system:
+      "You summarize live AI coding session transcripts. Respond with exactly " +
+      "one sentence, under 20 words, concretely describing what this session " +
+      "is currently working on, based on the prompts and output shown. Be " +
+      "specific (name the feature, file, or action — e.g. 'Refactoring " +
+      "checkout validation into a shared hook'), never generic ('Making code " +
+      "changes'). No preamble, no quotes.",
+    messages: [
+      {
+        role: "user",
+        content:
+          "Recent terminal output from the coding session (ANSI stripped):\n\n" +
+          s.buffer,
+      },
+    ],
+  });
+  const summary = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join(" ")
+    .trim();
+  if (!summary) return;
+
+  summaryCallCount++;
+  console.log(
+    `[tandem-server] summary #${summaryCallCount} for session ${sessionId}: ` +
+      `"${summary}"`
+  );
+
+  const at = new Date().toISOString();
+  const { error } = await supabase
+    .from("sessions")
+    .update({ last_summary: summary, last_summary_at: at })
+    .eq("id", sessionId);
+  if (error) {
+    console.error(
+      `[tandem-server] failed to store summary for ${sessionId}: ${error.message}`
+    );
+  }
+
+  if (liveblocks) {
+    try {
+      await liveblocks.mutateStorage(liveRoomId(s.roomId), ({ root }) => {
+        const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+        const session = sessions?.get(sessionId);
+        if (!session) return;
+        session.set("lastSummary", summary);
+        session.set("lastSummaryAt", at);
+      });
+    } catch (err) {
+      console.error(
+        `[tandem-server] liveblocks: failed to mirror summary for ` +
+          `${sessionId}: ${err instanceof Error ? err.message : err}`
+      );
+    }
+  }
+}
+
+if (anthropic) {
+  setInterval(() => {
+    void (async () => {
+      for (const [sessionId, s] of summaryStateBySession) {
+        // Session gone but state lingering (shouldn't happen — close handler
+        // deletes it): clean up defensively rather than paying for it.
+        if (!cliSocketBySession.has(sessionId)) {
+          summaryStateBySession.delete(sessionId);
+          continue;
+        }
+        if (!s.dirty) continue; // idle since last summary — no API call
+        s.dirty = false; // events arriving during the call re-mark it
+        try {
+          await summarizeSession(sessionId, s);
+        } catch (err) {
+          // Leave dirty=false: a persistent API failure must not hammer the
+          // API every tick; the next real event re-arms summarization.
+          console.error(
+            `[tandem-server] summarization failed for ${sessionId}: ` +
+              `${err instanceof Error ? err.message : err}`
+          );
+        }
+      }
+    })();
+  }, SUMMARY_INTERVAL_MS);
 }
 
 // ─── Branch endpoint (Stage 5) ───────────────────────────────────────────────
@@ -923,12 +1074,57 @@ async function handleControl(
   }
 }
 
+// ─── Activity endpoint (Stage 11) ────────────────────────────────────────────
+// Room-wide "who's doing what": all currently-active real sessions (branch
+// copies excluded — they're static) with owner email and latest summary,
+// sorted by most recently updated. Consumed by tandem-cli at startup to
+// inject teammate context into the generated memory file.
+
+async function handleActivity(
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+  const { data: sessions, error } = await supabase
+    .from("sessions")
+    .select("id, user_id, status, started_at, last_summary, last_summary_at")
+    .eq("room_id", roomId)
+    .eq("status", "active")
+    .is("parent_session_id", null)
+    .order("last_summary_at", { ascending: false, nullsFirst: false });
+  if (error) return sendJson(res, 500, { error: error.message });
+
+  const userIds = [...new Set((sessions ?? []).map((s) => s.user_id))];
+  const { data: profiles } = userIds.length
+    ? await supabase.from("profiles").select("id, email").in("id", userIds)
+    : { data: [] };
+  const emailById = Object.fromEntries(
+    (profiles ?? []).map((p) => [p.id, p.email])
+  );
+
+  sendJson(res, 200, {
+    sessions: (sessions ?? []).map((s) => ({
+      sessionId: s.id,
+      userId: s.user_id,
+      email: emailById[s.user_id] ?? s.user_id,
+      startedAt: s.started_at,
+      lastSummary: s.last_summary,
+      lastSummaryAt: s.last_summary_at,
+      connected: cliSocketBySession.has(s.id),
+    })),
+  });
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 const UUID = "[0-9a-fA-F-]{36}";
 const MEMORY_COLLECTION = new RegExp(`^/rooms/(${UUID})/memory$`);
 const MEMORY_ENTRY = new RegExp(`^/rooms/(${UUID})/memory/(${UUID})$`);
 const CHAT_COLLECTION = new RegExp(`^/rooms/(${UUID})/chat$`);
+const ACTIVITY = new RegExp(`^/rooms/(${UUID})/activity$`);
 const CONTROL_ACTION = new RegExp(
   `^/sessions/(${UUID})/control/(request|approve|deny|release)$`
 );
@@ -939,6 +1135,18 @@ const httpServer = createServer((req, res) => {
 
     if (req.method === "POST" && url === "/branch") {
       return handleBranch(req, res);
+    }
+
+    // Debug-only call-volume counter (no auth: a bare integer, nothing more).
+    if (req.method === "GET" && url === "/debug/summaries") {
+      return sendJson(res, 200, { summaryCalls: summaryCallCount });
+    }
+
+    const activity = url.match(ACTIVITY);
+    if (activity && req.method === "GET") {
+      const userId = await authUser(req, res);
+      if (!userId) return;
+      return handleActivity(res, activity[1], userId);
     }
 
     const controlMatch = url.match(CONTROL_ACTION);
@@ -1112,8 +1320,9 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     queue = queue.then(async () => {
       if (state) {
-        // Session over: nothing left to control.
+        // Session over: nothing left to control, nothing left to summarize.
         cliSocketBySession.delete(state.sessionId);
+        summaryStopSession(state.sessionId);
         await releaseControl(state.sessionId, "session CLI disconnected");
         await endSession(state);
         state = null;

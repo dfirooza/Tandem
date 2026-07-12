@@ -24,6 +24,9 @@ declare global {
           controllerId?: string | null
           pendingRequesterId?: string | null
           pendingRequestedAt?: string | null
+          /** Auto-summarized status line (Stage 11), written by tandem-server. */
+          lastSummary?: string | null
+          lastSummaryAt?: string | null
           events: LiveList<{
             eventType: string
             content: string

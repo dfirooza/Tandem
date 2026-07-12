@@ -435,6 +435,75 @@ export interface HistorySession {
   events: { content: string }[]
 }
 
+/** "12s ago" / "3m ago", ticking every 10s. */
+function RelativeTime({ since }: { since: string }) {
+  const compute = () => {
+    const s = Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 1000))
+    if (s < 60) return `${s}s ago`
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`
+    return `${Math.floor(s / 3600)}h ago`
+  }
+  const [label, setLabel] = useState(compute)
+  useEffect(() => {
+    const t = setInterval(() => setLabel(compute()), 10_000)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [since])
+  return <span>{label}</span>
+}
+
+/**
+ * Compact "who's doing what" row for an active session (Stage 11). Shows the
+ * live auto-summary; clicking expands into the full session view (xterm +
+ * branch/control), clicking again collapses.
+ */
+function CompactSessionRow({
+  sessionId,
+  session,
+  email,
+  expanded,
+  onToggle,
+}: {
+  sessionId: string
+  session: {
+    parentSessionId?: string | null
+    lastSummary?: string | null
+    lastSummaryAt?: string | null
+  }
+  email: string
+  expanded: boolean
+  onToggle: () => void
+}) {
+  const isBranch = !!session.parentSessionId
+  const summary = isBranch
+    ? 'Static branch copy — no live process attached'
+    : (session.lastSummary ?? 'Just started…')
+
+  return (
+    <button
+      onClick={onToggle}
+      className={`flex w-full cursor-pointer items-center gap-2.5 bg-transparent px-3 py-2 text-left transition-colors hover:bg-surface-hover ${
+        expanded ? 'bg-surface-hover' : ''
+      }`}
+    >
+      <span
+        className={`status-dot ${isBranch ? 'status-dot--ended' : 'status-dot--active'}`}
+        aria-hidden
+      />
+      <span className="shrink-0 text-[13px] font-medium text-foreground">{email}</span>
+      <span className="min-w-0 flex-1 truncate text-[13px] text-secondary">
+        {summary}
+      </span>
+      {session.lastSummaryAt && !isBranch && (
+        <span className="shrink-0 text-[11px] text-muted">
+          <RelativeTime since={session.lastSummaryAt} />
+        </span>
+      )}
+      <span className="shrink-0 text-[11px] text-muted">{expanded ? '▾' : '▸'}</span>
+    </button>
+  )
+}
+
 function SessionPanels({
   emailById,
   historySessions,
@@ -447,11 +516,21 @@ function SessionPanels({
   selfId: string
 }) {
   const sessions = useStorage((root) => root.sessions)
+  // Which active sessions are expanded into the full drill-down view.
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
 
   // useStorage snapshots a LiveMap as a plain readonly object keyed by sessionId.
   if (sessions === null)
     return <p className="text-muted">Connecting to live session feed…</p>
   const entries = Object.entries(sessions)
+
+  const toggleExpanded = (id: string) =>
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
 
   // Resolve a parent session's owner email for the lineage label. Owners come
   // from the page's durable query, falling back to live storage for sessions
@@ -475,11 +554,44 @@ function SessionPanels({
   // Hide a live panel only when it's empty AND replaced by a history panel.
   const liveEntries = entries.filter(([id]) => !backfillIds.has(id))
 
+  // Compact treatment (Stage 11): active sessions render as one summary row
+  // each, expanding to the full panel on click. Ended sessions keep their
+  // existing full-panel form.
+  const activeEntries = liveEntries.filter(([, s]) => s.status === 'active')
+  const endedEntries = liveEntries.filter(([, s]) => s.status !== 'active')
+
   if (backfill.length === 0 && liveEntries.length === 0)
     return <p className="text-muted">No sessions yet.</p>
 
   return (
     <div>
+      {activeEntries.length > 0 && (
+        <div className="card mb-4 divide-y divide-border overflow-hidden">
+          {activeEntries.map(([sessionId, session]) => (
+            <div key={sessionId}>
+              <CompactSessionRow
+                sessionId={sessionId}
+                session={session}
+                email={emailById[session.userId] ?? session.userId}
+                expanded={expandedIds.has(sessionId)}
+                onToggle={() => toggleExpanded(sessionId)}
+              />
+              {expandedIds.has(sessionId) && (
+                <div className="border-t border-border p-3">
+                  <SessionPanel
+                    sessionId={sessionId}
+                    session={session}
+                    email={emailById[session.userId] ?? session.userId}
+                    parentEmail={parentEmailFor(session.parentSessionId)}
+                    selfId={selfId}
+                    emailById={emailById}
+                  />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {backfill.length > 0 && (
         <div>
           <h3 className="eyebrow mb-3 mt-2">History (from durable log)</h3>
@@ -500,7 +612,7 @@ function SessionPanels({
           ))}
         </div>
       )}
-      {liveEntries.map(([sessionId, session]) => (
+      {endedEntries.map(([sessionId, session]) => (
         <SessionPanel
           key={sessionId}
           sessionId={sessionId}
