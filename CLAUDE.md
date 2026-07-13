@@ -29,19 +29,34 @@ and teammates can see each other's live Claude Code sessions in the web app.
 - session_events: id, session_id, type, content, created_at
 
 ## Current stage
-Stage 12 complete: room/endpoint visibility audit (found and fixed a 
-real gap — CLI WebSocket auth wasn't checking room membership, only 
-valid auth, meaning any signed-in user who knew a room UUID could join 
-a session in it; now enforced and proven closed across all 
-surfaces: rooms, sessions, memory, chat, activity, branch, control, 
-and both WS auth paths — 21/21 e2e). History simplified per user 
-feedback: only sessions/branches with a real summary appear, compact 
-single-line rows (owner, time, summary, branch badge if applicable), 
-with click-to-expand into the full raw content (expand was removed, 
-then restored per follow-up feedback) — Live Sessions unaffected.
-Next: in-terminal passive activity visibility, so users see teammate 
-updates without switching to the browser (highest-priority remaining 
-item from user feedback).
+Stage 13 complete: in-terminal passive activity visibility. Part A — a 
+persistent status bar reserved at the top of the terminal while tandem 
+claude runs beneath it: DECSTBM scroll region excludes the top rows, 
+the wrapped Claude Code process is told the reduced height (real rows 
+minus reserved) at spawn and on every resize, and the terminal's full 
+scroll region + reserved rows are restored on every exit path (normal, 
+Ctrl+C, SIGTERM, SIGHUP, uncaught). Auto-disables on non-TTY stdout, 
+terminals under 15 rows, or TANDEM_NO_STATUS_BAR; fetches room activity 
+every 15s and shows offline rather than stale on failure. Part B — a 
+one-shot `tandem status [--room <id>]` command that fetches activity + 
+summary-only history and prints, no PTY or persistent connection. New 
+GET /rooms/:roomId/history endpoint (membership-checked). Terminal 
+escape-sequence contract (region set, resize re-apply, restore on all 
+four exit paths) covered by an automated PTY-level test; the visual bar 
+itself is a manual check. Confirmed live: tandem status against a real 
+server, and session mode unregressed in non-TTY.
+Fixed post-verification: intermittent status bar flicker, caused by the 
+bar's periodic redraw using the terminal's single shared cursor 
+save/restore register (DECSC/DECRC, \x1b7/\x1b8) — when that redraw 
+landed between Claude Code's own cursor-save and cursor-restore (which 
+span multiple output chunks) it clobbered Claude's saved position, so 
+Claude's restore mis-placed the cursor and its next output painted over 
+the reserved rows; and because the bar only redrew on the 15s fetch 
+interval, it stayed gone for seconds. Fixed by repainting promptly 
+(throttled ~200ms) on Claude output so the bar heals in milliseconds 
+instead of seconds, re-asserting the scroll region on every draw, and 
+wrapping each draw in DEC synchronized output as a single atomic write. 
+Root cause proven and both fixes covered by regression tests (26/26).
 
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 

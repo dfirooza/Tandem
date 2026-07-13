@@ -1170,6 +1170,48 @@ async function handleActivity(
   });
 }
 
+// ─── History endpoint (Stage 13) ─────────────────────────────────────────────
+// Stage 12's simplified history rules, served over HTTP for `tandem status`:
+// summary-only (entries without a real summary don't exist here), ended
+// sessions and branch copies, newest first. No raw event content.
+
+async function handleHistory(
+  res: import("node:http").ServerResponse,
+  roomId: string,
+  userId: string
+) {
+  if (!(await isRoomMember(roomId, userId))) {
+    return sendJson(res, 403, { error: "not a member of this room" });
+  }
+  const { data: sessions, error } = await supabase
+    .from("sessions")
+    .select("id, user_id, status, parent_session_id, last_summary, last_summary_at")
+    .eq("room_id", roomId)
+    .not("last_summary", "is", null)
+    .or("status.eq.ended,parent_session_id.not.is.null")
+    .order("last_summary_at", { ascending: false })
+    .limit(12);
+  if (error) return sendJson(res, 500, { error: error.message });
+
+  const userIds = [...new Set((sessions ?? []).map((s) => s.user_id))];
+  const { data: profiles } = userIds.length
+    ? await supabase.from("profiles").select("id, email").in("id", userIds)
+    : { data: [] };
+  const emailById = Object.fromEntries(
+    (profiles ?? []).map((p) => [p.id, p.email])
+  );
+
+  sendJson(res, 200, {
+    sessions: (sessions ?? []).map((s) => ({
+      sessionId: s.id,
+      email: emailById[s.user_id] ?? s.user_id,
+      isBranch: s.parent_session_id !== null,
+      lastSummary: s.last_summary,
+      lastSummaryAt: s.last_summary_at,
+    })),
+  });
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 const UUID = "[0-9a-fA-F-]{36}";
@@ -1177,6 +1219,7 @@ const MEMORY_COLLECTION = new RegExp(`^/rooms/(${UUID})/memory$`);
 const MEMORY_ENTRY = new RegExp(`^/rooms/(${UUID})/memory/(${UUID})$`);
 const CHAT_COLLECTION = new RegExp(`^/rooms/(${UUID})/chat$`);
 const ACTIVITY = new RegExp(`^/rooms/(${UUID})/activity$`);
+const HISTORY = new RegExp(`^/rooms/(${UUID})/history$`);
 const CONTROL_ACTION = new RegExp(
   `^/sessions/(${UUID})/control/(request|approve|deny|release)$`
 );
@@ -1199,6 +1242,13 @@ const httpServer = createServer((req, res) => {
       const userId = await authUser(req, res);
       if (!userId) return;
       return handleActivity(res, activity[1], userId);
+    }
+
+    const history = url.match(HISTORY);
+    if (history && req.method === "GET") {
+      const userId = await authUser(req, res);
+      if (!userId) return;
+      return handleHistory(res, history[1], userId);
     }
 
     const controlMatch = url.match(CONTROL_ACTION);
