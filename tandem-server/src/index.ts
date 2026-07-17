@@ -7,6 +7,7 @@ import {
   LiveList,
   LiveMap,
   LiveObject,
+  type LsonObject,
 } from "@liveblocks/node";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -62,6 +63,32 @@ async function ensureLiveRoom(roomId: string): Promise<void> {
   ensuredLiveRooms.add(roomId);
 }
 
+// ─── Serialized room storage mutations ────────────────────────────────────────
+// mutateStorage is a read-modify-write; two of them running concurrently on
+// the same room can lost-update each other (e.g. a backgrounded session-start
+// that creates a fresh entry overwriting a control-request's pending fields).
+// All live-storage writes for a given room go through this per-room promise
+// chain so they apply strictly one at a time. Independent rooms don't block
+// each other, and this doesn't touch the concurrent Supabase writes.
+const roomMutationChain = new Map<string, Promise<unknown>>();
+
+function withRoomStorage(
+  roomId: string,
+  mutator: (ctx: { root: LiveObject<LsonObject> }) => void
+): Promise<void> {
+  if (!liveblocks) return Promise.resolve();
+  const lb = liveblocks;
+  const prev = roomMutationChain.get(roomId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {}) // one failed mutation must not wedge the chain
+    .then(() => lb.mutateStorage(liveRoomId(roomId), mutator));
+  roomMutationChain.set(roomId, next);
+  void next.catch(() => {}).finally(() => {
+    if (roomMutationChain.get(roomId) === next) roomMutationChain.delete(roomId);
+  });
+  return next; // caller keeps its own try/catch for this mutation's errors
+}
+
 /**
  * Live storage shape per room:
  *   root.sessions: LiveMap<sessionId, LiveObject<{
@@ -89,26 +116,48 @@ type LiveSession = LiveObject<{
   }>;
 }>;
 
+/** Get-or-create the live session entry inside a mutateStorage callback.
+    Get-or-create (never overwrite) so that a batch flush and liveSessionStart
+    racing on a newly-connected session can't wipe each other's events. */
+function ensureSessionEntry(
+  root: LiveObject<LsonObject>,
+  sessionId: string,
+  userId: string
+): LiveSession {
+  let sessions = root.get("sessions") as LiveMap<string, LiveSession>;
+  if (!sessions) {
+    sessions = new LiveMap();
+    root.set("sessions", sessions);
+  }
+  let session = sessions.get(sessionId);
+  if (!session) {
+    session = new LiveObject({
+      userId,
+      status: "active",
+      parentSessionId: null,
+      events: new LiveList([]),
+    });
+    sessions.set(sessionId, session);
+  }
+  return session;
+}
+
 async function liveSessionStart(state: ConnectionState): Promise<void> {
   if (!liveblocks) return;
   try {
+    const t0 = process.env.TANDEM_PERF ? performance.now() : 0;
     await ensureLiveRoom(state.roomId);
-    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
-      let sessions = root.get("sessions") as LiveMap<string, LiveSession>;
-      if (!sessions) {
-        sessions = new LiveMap();
-        root.set("sessions", sessions);
-      }
-      sessions.set(
-        state.sessionId,
-        new LiveObject({
-          userId: state.userId,
-          status: "active",
-          parentSessionId: null,
-          events: new LiveList([]),
-        })
-      );
+    const t1 = process.env.TANDEM_PERF ? performance.now() : 0;
+    await withRoomStorage(state.roomId, ({ root }) => {
+      ensureSessionEntry(root, state.sessionId, state.userId);
     });
+    if (process.env.TANDEM_PERF) {
+      const t2 = performance.now();
+      console.log(
+        `[perf] sessionStart ensureRoom=${(t1 - t0).toFixed(0)}ms ` +
+          `mutateStorage=${(t2 - t1).toFixed(0)}ms total=${(t2 - t0).toFixed(0)}ms`
+      );
+    }
   } catch (err) {
     console.error(
       `[tandem-server] liveblocks: failed to start session ` +
@@ -117,28 +166,124 @@ async function liveSessionStart(state: ConnectionState): Promise<void> {
   }
 }
 
-async function liveSessionEvent(
-  state: ConnectionState,
-  event: { eventType: string; content: string; raw?: string; timestamp: string }
-): Promise<void> {
-  if (!liveblocks) return;
-  try {
-    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
-      const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
-      sessions?.get(state.sessionId)?.get("events").push(event);
-    });
-  } catch (err) {
-    console.error(
-      `[tandem-server] liveblocks: failed to push event for session ` +
-        `${state.sessionId}: ${err instanceof Error ? err.message : err}`
-    );
+// ─── Event batching (perf) ────────────────────────────────────────────────────
+// Rapid PTY chunks are buffered per session and flushed together every
+// FLUSH_MS, instead of one Supabase insert + one Liveblocks round-trip per
+// chunk (which serialized behind the WS queue into multi-second backlogs).
+// Within a flush the durable Supabase write and the live Liveblocks push run
+// CONCURRENTLY — the live view is no longer gated behind the DB write.
+
+const FLUSH_MS = Number(process.env.TANDEM_FLUSH_MS ?? 40);
+
+interface EventBuffer {
+  roomId: string;
+  userId: string;
+  /** Rows pending durable insert. */
+  rows: { session_id: string; type: string; content: string; created_at: string }[];
+  /** Events pending the live push (carry raw ANSI for xterm). */
+  live: { eventType: string; content: string; raw?: string; timestamp: string }[];
+  timer: NodeJS.Timeout | null;
+  /** Serializes flushes per session so two mutateStorage calls never overlap. */
+  chain: Promise<void>;
+}
+
+const eventBufferBySession = new Map<string, EventBuffer>();
+
+function bufferFor(state: ConnectionState): EventBuffer {
+  let b = eventBufferBySession.get(state.sessionId);
+  if (!b) {
+    b = {
+      roomId: state.roomId,
+      userId: state.userId,
+      rows: [],
+      live: [],
+      timer: null,
+      chain: Promise.resolve(),
+    };
+    eventBufferBySession.set(state.sessionId, b);
   }
+  return b;
+}
+
+function scheduleFlush(sessionId: string): void {
+  const b = eventBufferBySession.get(sessionId);
+  if (!b || b.timer) return;
+  b.timer = setTimeout(() => {
+    b.timer = null;
+    b.chain = b.chain.then(() => drainBuffer(sessionId)).catch(() => {});
+  }, FLUSH_MS);
+}
+
+/** Drains everything currently buffered for the session in batches, Supabase
+    insert and Liveblocks push running concurrently per batch. */
+async function drainBuffer(sessionId: string): Promise<void> {
+  const b = eventBufferBySession.get(sessionId);
+  if (!b) return;
+  while (b.rows.length > 0 || b.live.length > 0) {
+    const rows = b.rows;
+    const live = b.live;
+    b.rows = [];
+    b.live = [];
+    const t0 = process.env.TANDEM_PERF ? performance.now() : 0;
+
+    // Durable write — concurrent with the live push, no longer in front of it.
+    const durable =
+      rows.length > 0
+        ? supabase
+            .from("session_events")
+            .insert(rows)
+            .then(({ error }) => {
+              if (error) {
+                console.error(
+                  `[tandem-server] batch insert (${rows.length}) failed for ` +
+                    `${sessionId}: ${error.message}`
+                );
+              }
+            })
+        : Promise.resolve();
+
+    // Live push — one serialized mutateStorage for the whole batch.
+    const pushed =
+      liveblocks && live.length > 0
+        ? withRoomStorage(b.roomId, ({ root }) => {
+            const session = ensureSessionEntry(root, sessionId, b.userId);
+            const list = session.get("events");
+            for (const e of live) list.push(e);
+          }).catch((err: unknown) => {
+            console.error(
+              `[tandem-server] batch liveblocks (${live.length}) failed for ` +
+                `${sessionId}: ${err instanceof Error ? err.message : err}`
+            );
+          })
+        : Promise.resolve();
+
+    await Promise.all([durable, pushed]);
+    if (process.env.TANDEM_PERF) {
+      console.log(
+        `[perf] flush n=${live.length} took=${(performance.now() - t0).toFixed(0)}ms ` +
+          `(supabase+liveblocks concurrent)`
+      );
+    }
+  }
+}
+
+/** Flush any remaining buffered events and drop the buffer (session ending). */
+async function flushAndCloseBuffer(sessionId: string): Promise<void> {
+  const b = eventBufferBySession.get(sessionId);
+  if (!b) return;
+  if (b.timer) {
+    clearTimeout(b.timer);
+    b.timer = null;
+  }
+  b.chain = b.chain.then(() => drainBuffer(sessionId)).catch(() => {});
+  await b.chain;
+  eventBufferBySession.delete(sessionId);
 }
 
 async function liveSessionEnd(state: ConnectionState): Promise<void> {
   if (!liveblocks) return;
   try {
-    await liveblocks.mutateStorage(liveRoomId(state.roomId), ({ root }) => {
+    await withRoomStorage(state.roomId, ({ root }) => {
       const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
       sessions?.get(state.sessionId)?.set("status", "ended");
     });
@@ -239,13 +384,11 @@ async function handleAuth(
     sessionId: session.id,
   };
 
-  // Seed the Liveblocks entry BEFORE auth_ok too: control-state mirroring
-  // assumes the session entry exists once anyone knows the sessionId.
-  // (liveSessionStart never throws — Liveblocks failures are logged inside.)
-  await liveSessionStart(state);
-
-  // The socket may have closed while the writes above were in flight; the
-  // session row still exists and the close handler will mark it ended.
+  // Send auth_ok IMMEDIATELY — do not block it on Liveblocks. The cold-start
+  // Liveblocks room+storage init (~3s first time for a room) used to sit in
+  // front of auth_ok. It now runs in the background; the session entry is
+  // get-or-create, and the batch flush also creates it on demand, so events
+  // that arrive before liveSessionStart finishes are not lost.
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "auth_ok", sessionId: session.id }));
   }
@@ -253,10 +396,14 @@ async function handleAuth(
     `[tandem-server] session ${session.id} started ` +
       `(user ${msg.userId}, room ${msg.roomId})`
   );
+  void liveSessionStart(state);
   return state;
 }
 
-async function handleEvent(state: ConnectionState, msg: EventMessage) {
+/** Buffers an event for batched flush. Synchronous and cheap — it does NOT
+    do any cloud I/O, so the per-connection message queue drains immediately
+    (no more per-event round-trip stacking into a multi-second backlog). */
+function handleEvent(state: ConnectionState, msg: EventMessage, arrivedAt?: number) {
   if (msg.sessionId !== state.sessionId) {
     console.warn(
       `[tandem-server] dropping event with mismatched sessionId ` +
@@ -264,26 +411,27 @@ async function handleEvent(state: ConnectionState, msg: EventMessage) {
     );
     return;
   }
-  const { error } = await supabase.from("session_events").insert({
+  const b = bufferFor(state);
+  b.rows.push({
     session_id: state.sessionId,
     type: msg.eventType,
     content: msg.content,
     created_at: msg.timestamp,
   });
-  if (error) {
-    console.error(
-      `[tandem-server] failed to insert event for session ` +
-        `${state.sessionId}: ${error.message}`
-    );
-  }
-  await liveSessionEvent(state, {
+  b.live.push({
     eventType: msg.eventType,
     content: msg.content,
-    // Raw ANSI goes to the live layer only (xterm rendering); Supabase keeps
-    // the stripped form as the durable, searchable record.
+    // Raw ANSI feeds xterm; Supabase keeps only the stripped form.
     ...(typeof msg.raw === "string" ? { raw: msg.raw } : {}),
     timestamp: msg.timestamp,
   });
+  scheduleFlush(state.sessionId);
+  if (process.env.TANDEM_PERF && arrivedAt) {
+    console.log(
+      `[perf] event buffered queueWait=${(performance.now() - arrivedAt).toFixed(1)}ms ` +
+        `pending=${b.live.length}`
+    );
+  }
   // Feed the summarizer (Stage 11) — marks the session dirty for the next tick.
   summaryTrackEvent(state, msg.content);
 }
@@ -329,16 +477,13 @@ async function endSession(state: ConnectionState) {
     if (liveblocks) {
       for (const orphan of orphans) {
         try {
-          await liveblocks.mutateStorage(
-            liveRoomId(orphan.room_id),
-            ({ root }) => {
-              const sessions = root.get("sessions") as LiveMap<
-                string,
-                LiveSession
-              >;
-              sessions?.get(orphan.id)?.set("status", "ended");
-            }
-          );
+          await withRoomStorage(orphan.room_id, ({ root }) => {
+            const sessions = root.get("sessions") as LiveMap<
+              string,
+              LiveSession
+            >;
+            sessions?.get(orphan.id)?.set("status", "ended");
+          });
         } catch {
           // Room may not exist in Liveblocks; the durable record is what counts.
         }
@@ -385,13 +530,18 @@ async function mirrorControl(
     controllerId: string | null;
     pendingRequesterId: string | null;
     pendingRequestedAt: string | null;
-  }
+  },
+  // Owner userId lets the mirror create the session entry if liveSessionStart
+  // (backgrounded since the cold-start fix) hasn't created it yet — otherwise
+  // an early control request would mirror into a non-existent entry (no-op).
+  ownerUserId?: string
 ): Promise<void> {
   if (!liveblocks) return;
   try {
-    await liveblocks.mutateStorage(liveRoomId(roomId), ({ root }) => {
-      const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
-      const session = sessions?.get(sessionId);
+    await withRoomStorage(roomId, ({ root }) => {
+      const session = ownerUserId
+        ? ensureSessionEntry(root, sessionId, ownerUserId)
+        : (root.get("sessions") as LiveMap<string, LiveSession>)?.get(sessionId);
       if (!session) return;
       session.set("controllerId", fields.controllerId);
       session.set("pendingRequesterId", fields.pendingRequesterId);
@@ -541,7 +691,7 @@ async function summarizeSession(sessionId: string, s: SummaryState): Promise<voi
 
   if (liveblocks) {
     try {
-      await liveblocks.mutateStorage(liveRoomId(s.roomId), ({ root }) => {
+      await withRoomStorage(s.roomId, ({ root }) => {
         const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
         const session = sessions?.get(sessionId);
         if (!session) return;
@@ -746,7 +896,7 @@ async function handleBranch(
   if (liveblocks) {
     try {
       await ensureLiveRoom(source.room_id);
-      await liveblocks.mutateStorage(liveRoomId(source.room_id), ({ root }) => {
+      await withRoomStorage(source.room_id, ({ root }) => {
         let sessions = root.get("sessions") as LiveMap<string, LiveSession>;
         if (!sessions) {
           sessions = new LiveMap();
@@ -802,7 +952,7 @@ async function handleBranch(
           .update({ last_summary: summary, last_summary_at: at })
           .eq("id", branch.id);
         if (liveblocks) {
-          await liveblocks.mutateStorage(liveRoomId(source.room_id), ({ root }) => {
+          await withRoomStorage(source.room_id, ({ root }) => {
             const sessions = root.get("sessions") as LiveMap<string, LiveSession>;
             const entry = sessions?.get(branch.id);
             if (!entry) return;
@@ -955,7 +1105,7 @@ async function handleChatCreate(
   if (liveblocks) {
     try {
       await ensureLiveRoom(roomId);
-      await liveblocks.mutateStorage(liveRoomId(roomId), ({ root }) => {
+      await withRoomStorage(roomId, ({ root }) => {
         let chat = root.get("chatMessages") as LiveList<LiveChatMessage>;
         if (!chat) {
           chat = new LiveList([]);
@@ -1054,11 +1204,16 @@ async function handleControl(
       console.log(
         `[tandem-server] control requested for session ${sessionId} by ${userId}`
       );
-      await mirrorControl(roomId, sessionId, {
-        controllerId: null,
-        pendingRequesterId: userId,
-        pendingRequestedAt: new Date(requestedAt).toISOString(),
-      });
+      await mirrorControl(
+        roomId,
+        sessionId,
+        {
+          controllerId: null,
+          pendingRequesterId: userId,
+          pendingRequestedAt: new Date(requestedAt).toISOString(),
+        },
+        ownerId // create the entry if liveSessionStart hasn't yet
+      );
       return sendJson(res, 200, { pending: true });
     }
 
@@ -1079,11 +1234,16 @@ async function handleControl(
         `[tandem-server] control of session ${sessionId} granted to ` +
           `${pending.requesterId} by owner ${userId}`
       );
-      await mirrorControl(roomId, sessionId, {
-        controllerId: pending.requesterId,
-        pendingRequesterId: null,
-        pendingRequestedAt: null,
-      });
+      await mirrorControl(
+        roomId,
+        sessionId,
+        {
+          controllerId: pending.requesterId,
+          pendingRequesterId: null,
+          pendingRequestedAt: null,
+        },
+        ownerId
+      );
       return sendJson(res, 200, { controllerId: pending.requesterId });
     }
 
@@ -1342,7 +1502,12 @@ async function handleWebAuth(
 /** SECURITY-CRITICAL: re-verify the sender against the CURRENT controller in
     server memory on EVERY message. Unauthorized input is silently dropped
     (logged server-side) so control state is not leaked to probers. */
-function handleSessionInput(webUserId: string, msg: SessionInputMessage): void {
+function handleSessionInput(
+  webUserId: string,
+  msg: SessionInputMessage,
+  arrivedAt?: number
+): void {
+  const perf = process.env.TANDEM_PERF ? performance.now() : 0;
   if (typeof msg.sessionId !== "string" || typeof msg.content !== "string") {
     return;
   }
@@ -1359,6 +1524,13 @@ function handleSessionInput(webUserId: string, msg: SessionInputMessage): void {
   if (cliWs && cliWs.readyState === WebSocket.OPEN) {
     cliWs.send(JSON.stringify({ type: "input", content: msg.content }));
   }
+  if (process.env.TANDEM_PERF) {
+    const done = performance.now();
+    const queueWait = arrivedAt ? (perf - arrivedAt).toFixed(1) : "?";
+    console.log(
+      `[perf] session_input queueWait=${queueWait}ms verify+forward=${(done - perf).toFixed(2)}ms`
+    );
+  }
 }
 
 wss.on("connection", (ws) => {
@@ -1373,6 +1545,7 @@ wss.on("connection", (ws) => {
   let queue: Promise<void> = Promise.resolve();
 
   ws.on("message", (raw) => {
+    const arrivedAt = process.env.TANDEM_PERF ? performance.now() : 0;
     queue = queue.then(async () => {
       // Do NOT skip processing when the socket has since closed: messages
       // received while open may still be queued behind slow DB writes when
@@ -1407,7 +1580,7 @@ wss.on("connection", (ws) => {
           ws.close(CLOSE_PROTOCOL_ERROR, `unexpected message type: ${msg.type}`);
           return;
         }
-        handleSessionInput(webUserId, msg);
+        handleSessionInput(webUserId, msg, arrivedAt);
         return;
       }
 
@@ -1415,7 +1588,7 @@ wss.on("connection", (ws) => {
         ws.close(CLOSE_PROTOCOL_ERROR, `unexpected message type: ${msg.type}`);
         return;
       }
-      await handleEvent(state!, msg);
+      handleEvent(state!, msg, arrivedAt);
     });
   });
 
@@ -1426,6 +1599,9 @@ wss.on("connection", (ws) => {
         cliSocketBySession.delete(state.sessionId);
         summaryStopSession(state.sessionId);
         await releaseControl(state.sessionId, "session CLI disconnected");
+        // Flush any buffered tail events BEFORE marking the session ended, so
+        // the final output isn't lost and lands before the "ended" status.
+        await flushAndCloseBuffer(state.sessionId);
         await endSession(state);
         state = null;
       }

@@ -58,6 +58,24 @@ instead of seconds, re-asserting the scroll region on every draw, and
 wrapping each draw in DEC synchronized output as a single atomic write. 
 Root cause proven and both fixes covered by regression tests (26/26).
 
+## Performance fix (post Stage 13)
+Fixed severe live-path latency: measured a 20-event burst backlog of 
+~13.5s (durable-write-gated live path + per-event serialized cloud 
+round-trips) down to ~0.46s. Fixes: (1) Supabase and Liveblocks writes 
+now fire concurrently instead of sequentially, (2) PTY chunks batch 
+into a single Liveblocks/Supabase write per ~40ms window instead of one 
+cloud round-trip per chunk, (3) cold-start Liveblocks room setup moved 
+to background so auth_ok returns immediately (~3.3s -> ~600ms). A real 
+race condition surfaced during this work — backgrounding the cold-start 
+write created concurrent unserialized writes to the same room's 
+Liveblocks storage, causing a lost-update bug that silently wiped 
+pending control requests (Stage 10 went flaky, 23/24). Fixed with 
+per-room write serialization (a promise-chain ensuring all 8 
+mutateStorage call sites for a given room never race each other) — 
+confirmed with 4 consecutive clean runs of the control test suite. All 
+9 stage regression suites green post-fix. TANDEM_PERF env-gated timing 
+instrumentation left in place for future diagnostics (off by default).
+
 ## Rules for any AI assistant working in this repo
 - Stay within the current stage's scope. Do not implement future-stage 
   features "while you're at it."
