@@ -20,8 +20,15 @@ config({ path: path.join(__dirname, "..", ".env") });
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 const PORT = Number(process.env.PORT ?? 8787);
-const TEST_EMAIL = "test-e2e@tandem.dev";
-const TEST_PASSWORD = "testpassword123";
+// Test-account credentials come from tandem-server/.env (see .env.example).
+// The email is an identifier and falls back to a default; the password is
+// real and is never hardcoded here.
+const TEST_EMAIL = process.env.TANDEM_TEST_EMAIL_A ?? "test-e2e@tandem.dev";
+const TEST_PASSWORD = process.env.TANDEM_TEST_PASSWORD;
+if (!TEST_PASSWORD) {
+  console.error("Missing TANDEM_TEST_PASSWORD in tandem-server/.env — see .env.example");
+  process.exit(1);
+}
 
 const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },

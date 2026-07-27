@@ -24,8 +24,23 @@ const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, LIVEBLOCKS_SECRET_KEY } =
 const PORT = Number(process.env.PORT ?? 8787);
 const BRANCH_URL = `http://localhost:${PORT}/branch`;
 
-const USER_A = { email: "test-e2e@tandem.dev", password: "testpassword123" };
-const USER_B = { email: "test-e2e-b@tandem.dev", password: "testpassword123" };
+// Test-account credentials come from tandem-server/.env (see .env.example).
+// Emails are identifiers and fall back to defaults; the password is real and
+// is never hardcoded here.
+const TEST_PASSWORD = process.env.TANDEM_TEST_PASSWORD;
+if (!TEST_PASSWORD) {
+  console.error("Missing TANDEM_TEST_PASSWORD in tandem-server/.env — see .env.example");
+  process.exit(1);
+}
+
+const USER_A = {
+  email: process.env.TANDEM_TEST_EMAIL_A ?? "test-e2e@tandem.dev",
+  password: TEST_PASSWORD,
+};
+const USER_B = {
+  email: process.env.TANDEM_TEST_EMAIL_B ?? "test-e2e-b@tandem.dev",
+  password: TEST_PASSWORD,
+};
 
 const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
