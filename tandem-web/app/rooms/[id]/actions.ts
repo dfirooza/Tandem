@@ -134,7 +134,12 @@ export async function sendChatMessage(
     const json = (await res.json().catch(() => ({}))) as { error?: string }
     if (!res.ok) return { error: json.error ?? `tandem-server returned ${res.status}` }
     return { ok: true }
-  } catch {
+  } catch (err) {
+    // TEMPORARY debug — remove once the chat send failure is diagnosed.
+    console.error('[tandem debug] sendChatMessage fetch failed', {
+      TANDEM_SERVER_URL: process.env.TANDEM_SERVER_URL,
+      error: err,
+    })
     return { error: 'could not reach tandem-server — is it running?' }
   }
 }
