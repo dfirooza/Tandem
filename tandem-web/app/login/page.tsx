@@ -1,4 +1,5 @@
 import { signIn } from '@/app/auth/actions'
+import DemoAccount from './demo-account'
 
 export default async function LoginPage({
   searchParams,
@@ -18,7 +19,14 @@ export default async function LoginPage({
         <form action={signIn} className="space-y-4">
           <label>
             Email
-            <input className="input" type="email" name="email" required autoComplete="email" />
+            <input
+              className="input"
+              type="email"
+              name="email"
+              id="email"
+              required
+              autoComplete="email"
+            />
           </label>
           <label>
             Password
@@ -26,6 +34,7 @@ export default async function LoginPage({
               className="input"
               type="password"
               name="password"
+              id="password"
               required
               autoComplete="current-password"
             />
@@ -38,6 +47,7 @@ export default async function LoginPage({
       <p className="mt-4 text-center text-sm text-muted">
         No account? <a href="/signup">Sign up</a>
       </p>
+      <DemoAccount />
     </main>
   )
 }
