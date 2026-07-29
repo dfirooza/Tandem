@@ -9,3 +9,4 @@ TANDEM_MEMORY.md
 .env
 .env.local
 .env.*.local
+tandem-server/CLAUDE.md
